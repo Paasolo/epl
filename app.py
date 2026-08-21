@@ -11,7 +11,7 @@ import streamlit as st
 
 from epl_predictor.context import PREMIER_LEAGUE_2026_27, PROMOTED_TEAMS, TEAM_CONTEXT
 from epl_predictor.engine import MODEL_API_VERSION, build_backtest_rows, clear_model_cache, get_model, ranked_picks
-from epl_predictor.fixtures import fixtures_for, matchweek_options
+from epl_predictor.fixtures import fixtures_for, matchweek_options, validate_matchweeks
 
 st.set_page_config(
     page_title="EPL Match Predictor 2026/27",
@@ -465,23 +465,16 @@ def render_backtest_tab(model) -> None:
     st.dataframe(pd.DataFrame(conf_rows), hide_index=True, use_container_width=True)
 
     st.markdown("**Home vs away correctness**")
-    ha_rows = [
-        {
-            "Side": "Home wins predicted",
-            "Matches": int((frame["predicted"] == "H").sum()),
-            "Accuracy": f"{frame.loc[frame['predicted'] == 'H', 'correct'].mean()*100:.1f}%",
-        },
-        {
-            "Side": "Draws predicted",
-            "Matches": int((frame["predicted"] == "D").sum()),
-            "Accuracy": f"{frame.loc[frame['predicted'] == 'D', 'correct'].mean()*100:.1f}%",
-        },
-        {
-            "Side": "Away wins predicted",
-            "Matches": int((frame["predicted"] == "A").sum()),
-            "Accuracy": f"{frame.loc[frame['predicted'] == 'A', 'correct'].mean()*100:.1f}%",
-        },
-    ]
+    ha_rows = []
+    for side, code in (("Home wins predicted", "H"), ("Draws predicted", "D"), ("Away wins predicted", "A")):
+        subset = frame.loc[frame["predicted"] == code, "correct"]
+        ha_rows.append(
+            {
+                "Side": side,
+                "Matches": int(len(subset)),
+                "Accuracy": f"{subset.mean()*100:.1f}%" if len(subset) else "—",
+            }
+        )
     st.dataframe(pd.DataFrame(ha_rows), hide_index=True, use_container_width=True)
 
     st.markdown("**Accuracy by month**")
@@ -516,20 +509,23 @@ def render_backtest_tab(model) -> None:
 
     st.markdown("**Biggest misses** (wrong calls with the highest model probability)")
     misses = frame.loc[~frame["correct"]].sort_values("best_prob", ascending=False).head(15)
-    miss_view = pd.DataFrame(
-        {
-            "Date": [
-                d.strftime("%d %b %Y") if pd.notna(d) else "—" for d in misses["date"]
-            ],
-            "Match": misses["match"].to_list(),
-            "Score": misses["score"].to_list(),
-            "Predicted": misses["predicted"].map({"H": "Home", "D": "Draw", "A": "Away"}).to_list(),
-            "Actual": misses["actual"].map({"H": "Home", "D": "Draw", "A": "Away"}).to_list(),
-            "Model %": (misses["best_prob"] * 100).round(1).to_list(),
-            "Confidence": misses["confidence"].to_list(),
-        }
-    )
-    st.dataframe(miss_view, hide_index=True, use_container_width=True)
+    if misses.empty:
+        st.info("No misses in this sample — every calibrated pick matched the result.")
+    else:
+        miss_view = pd.DataFrame(
+            {
+                "Date": [
+                    d.strftime("%d %b %Y") if pd.notna(d) else "—" for d in misses["date"]
+                ],
+                "Match": misses["match"].to_list(),
+                "Score": misses["score"].to_list(),
+                "Predicted": misses["predicted"].map({"H": "Home", "D": "Draw", "A": "Away"}).to_list(),
+                "Actual": misses["actual"].map({"H": "Home", "D": "Draw", "A": "Away"}).to_list(),
+                "Model %": (misses["best_prob"] * 100).round(1).to_list(),
+                "Confidence": misses["confidence"].to_list(),
+            }
+        )
+        st.dataframe(miss_view, hide_index=True, use_container_width=True)
 
     export = frame.copy()
     export["date"] = export["date"].map(lambda d: d.strftime("%Y-%m-%d") if pd.notna(d) else "")
@@ -769,6 +765,9 @@ def render_predict_tab(model) -> None:
 
 def main() -> None:
     model = load_fitted_model()
+    mw_problems = validate_matchweeks()
+    if mw_problems:
+        st.warning("Fixture slate issue: " + "; ".join(mw_problems[:3]))
 
     st.markdown(
         """

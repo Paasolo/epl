@@ -15,7 +15,7 @@ py -m streamlit run app.py
 
 The app opens in your browser with three tabs:
 
-- **Predict matches** — load Matchweeks 1–4 (or add/remove fixtures by hand), toggle the summer overlay on/off, then click **Predict**. The model ranks every selected match and shows how much signings/coaching moved each pick. Download the ranked slate as CSV or JSON.
+- **Predict matches** — load any official Matchweek 1–38 (or add/remove fixtures by hand), toggle the summer overlay on/off, then click **Predict**. The model ranks every selected match and shows how much signings/coaching moved each pick. Download the ranked slate as CSV or JSON.
 - **Team strength** — Elo, attack/defence, recent form, manager, and promotion status for all 20 clubs.
 - **Backtest explorer** — walk-forward 2025/26 accuracy by confidence band, month, and biggest misses.
 
