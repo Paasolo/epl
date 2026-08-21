@@ -105,7 +105,22 @@ def team_label(name: str) -> str:
     return name
 
 
-def outcome_chart(pred: dict, key: str) -> go.Figure:
+MAX_MATCHES = 10
+DEFAULT_FIXTURES = [
+    ("Arsenal", "Home", "Coventry City"),
+    ("Manchester United", "Away", "Hull City"),
+    ("Newcastle United", "Home", "Liverpool"),
+    ("Manchester City", "Home", "AFC Bournemouth"),
+    ("Fulham", "Home", "Chelsea"),
+    ("Brentford", "Home", "Tottenham Hotspur"),
+    ("Brighton & Hove Albion", "Home", "Aston Villa"),
+    ("Ipswich Town", "Home", "Sunderland"),
+    ("Nottingham Forest", "Home", "Leeds United"),
+    ("Everton", "Home", "Crystal Palace"),
+]
+
+
+def outcome_chart(pred: dict) -> go.Figure:
     labels = [
         f"{pred['home_display']} win",
         "Draw",
@@ -156,7 +171,7 @@ def render_prediction(pred: dict, easiest: bool) -> None:
     if ctx_a["change_type"] != "none":
         chips.append(f"New coach: {ctx_a['manager']}")
 
-    easiest_html = '<span class="chip hot">Easiest call of the pair</span>' if easiest else ""
+    easiest_html = '<span class="chip hot">Easiest call in this set</span>' if easiest else ""
     chip_html = "".join(f'<span class="chip">{c}</span>' for c in chips) + easiest_html
 
     pick_team = {
@@ -182,7 +197,11 @@ def render_prediction(pred: dict, easiest: bool) -> None:
         """,
         unsafe_allow_html=True,
     )
-    st.plotly_chart(outcome_chart(pred, pred["home_display"]), use_container_width=True)
+    st.plotly_chart(
+        outcome_chart(pred),
+        use_container_width=True,
+        key=f"chart-{pred['home_display']}-{pred['away_display']}-{pred.get('slot_id', 0)}",
+    )
 
     extras = pred["extras"]
     st.markdown("**Most likely supporting outcomes**")
@@ -235,10 +254,10 @@ def main() -> None:
         """
         <div class="hero">
           <h1>Premier League match predictor</h1>
-          <p>Pick two 2026/27 fixtures. The model is fitted on every Premier League match in
-          <code>epl_final.csv</code> (2000/01–2025/26), then adjusted for this summer’s signings
-          and coaching changes. It ranks the most likely 1X2 result and flags which game is
-          the easier, higher-confidence call.</p>
+          <p>Add as many 2026/27 fixtures as you want. The model is fitted on every Premier League
+          match in <code>epl_final.csv</code> (2000/01–2025/26), then adjusted for this summer’s
+          signings and coaching changes. It ranks the most likely 1X2 results and flags the
+          easiest, highest-confidence calls in the set.</p>
         </div>
         """,
         unsafe_allow_html=True,
@@ -269,62 +288,133 @@ def main() -> None:
     teams = PREMIER_LEAGUE_2026_27
     labels = {t: team_label(t) for t in teams}
 
-    st.subheader("Select two matches")
-    st.caption("Choose a club, whether they are at home or away, then the opponent. Both fixtures are predicted together.")
+    if "match_ids" not in st.session_state:
+        st.session_state.match_ids = [0, 1]
+        st.session_state.next_match_id = 2
 
-    c1, c2 = st.columns(2)
-    with c1:
-        st.markdown("**Match 1**")
-        club1 = st.selectbox("Club", teams, index=teams.index("Arsenal"), format_func=lambda t: labels[t], key="club1")
-        venue1 = st.radio("This club is playing", ["Home", "Away"], horizontal=True, key="venue1")
-        opps1 = [t for t in teams if t != club1]
-        opp1 = st.selectbox("Opponent", opps1, index=opps1.index("Coventry City") if "Coventry City" in opps1 else 0, format_func=lambda t: labels[t], key="opp1")
-        h1, a1 = resolve_fixture(club1, venue1, opp1)
-        st.caption(f"Fixture: **{h1}** vs **{a1}**")
+    st.subheader("Select matches")
+    st.caption("Choose a club, home or away, then the opponent. Add more fixtures to predict a full slate at once.")
 
-    with c2:
-        st.markdown("**Match 2**")
-        club2 = st.selectbox("Club", teams, index=teams.index("Manchester United"), format_func=lambda t: labels[t], key="club2")
-        venue2 = st.radio("This club is playing", ["Home", "Away"], horizontal=True, key="venue2", index=1)
-        opps2 = [t for t in teams if t != club2]
-        default_opp2 = "Hull City" if "Hull City" in opps2 else opps2[0]
-        opp2 = st.selectbox("Opponent", opps2, index=opps2.index(default_opp2), format_func=lambda t: labels[t], key="opp2")
-        h2, a2 = resolve_fixture(club2, venue2, opp2)
-        st.caption(f"Fixture: **{h2}** vs **{a2}**")
+    add_col, _ = st.columns([1, 3])
+    with add_col:
+        if st.button("Add match", disabled=len(st.session_state.match_ids) >= MAX_MATCHES, use_container_width=True):
+            st.session_state.match_ids.append(st.session_state.next_match_id)
+            st.session_state.next_match_id += 1
+            st.rerun()
 
-    if {h1, a1} == {h2, a2} and h1 == h2:
-        st.warning("Both cards are the same fixture. Change one so the model can compare two matches.")
+    fixtures: list[tuple[int, str, str]] = []
+    ids = list(st.session_state.match_ids)
+    for idx, match_id in enumerate(ids):
+        club_default, venue_default, opp_default = DEFAULT_FIXTURES[match_id % len(DEFAULT_FIXTURES)]
+        st.markdown(f"**Match {idx + 1}**")
+        c1, c2, c3, c4 = st.columns([2.2, 1.2, 2.2, 0.7])
+        with c1:
+            club = st.selectbox(
+                "Club",
+                teams,
+                index=teams.index(club_default),
+                format_func=lambda t: labels[t],
+                key=f"club_{match_id}",
+            )
+        with c2:
+            venue = st.radio(
+                "This club is playing",
+                ["Home", "Away"],
+                index=0 if venue_default == "Home" else 1,
+                horizontal=True,
+                key=f"venue_{match_id}",
+            )
+        with c3:
+            opps = [t for t in teams if t != club]
+            opp_index = opps.index(opp_default) if opp_default in opps else 0
+            opponent = st.selectbox(
+                "Opponent",
+                opps,
+                index=opp_index,
+                format_func=lambda t: labels[t],
+                key=f"opp_{match_id}",
+            )
+        with c4:
+            st.markdown("<div style='height: 1.7rem'></div>", unsafe_allow_html=True)
+            if st.button("Remove", disabled=len(ids) <= 1, key=f"remove_{match_id}", use_container_width=True):
+                st.session_state.match_ids = [mid for mid in st.session_state.match_ids if mid != match_id]
+                st.rerun()
+        home, away = resolve_fixture(club, venue, opponent)
+        st.caption(f"Fixture: **{home}** vs **{away}**")
+        fixtures.append((match_id, home, away))
 
-    run = st.button("Predict both matches", type="primary", use_container_width=True)
+    seen: dict[tuple[str, str], int] = {}
+    duplicates = []
+    for match_id, home, away in fixtures:
+        key = (home, away)
+        if key in seen:
+            duplicates.append(f"{home} vs {away}")
+        seen[key] = match_id
+    if duplicates:
+        st.warning("Duplicate fixture in the list: " + ", ".join(sorted(set(duplicates))) + ". Remove one copy so the ranking stays clean.")
+
+    n = len(fixtures)
+    run = st.button(f"Predict {n} match{'es' if n != 1 else ''}", type="primary", use_container_width=True)
 
     if run:
-        if h1 == a1 or h2 == a2:
+        if any(home == away for _, home, away in fixtures):
             st.error("A team cannot play itself.")
             return
-        preds = [model.predict_fixture(h1, a1), model.predict_fixture(h2, a2)]
+        preds = []
+        for match_id, home, away in fixtures:
+            pred = model.predict_fixture(home, away)
+            pred["slot_id"] = match_id
+            preds.append(pred)
         ranked = ranked_picks(preds)
         easiest = ranked[0]
-        other = ranked[1]
-        preds[0]["is_easiest"] = easiest is preds[0]
-        preds[1]["is_easiest"] = easiest is preds[1]
+        easiest_ids = {id(ranked[0])}
+        for pred in preds:
+            pred["is_easiest"] = id(pred) in easiest_ids
+
+        if len(ranked) == 1:
+            banner_extra = ""
+        else:
+            runners = "; ".join(
+                f"{row['home_display']} vs {row['away_display']} — {row['best_label']} ({row['best_prob']*100:.1f}%)"
+                for row in ranked[1:3]
+            )
+            banner_extra = f" Next in the ranking: {runners}."
 
         st.markdown(
             f"""
             <div class="easy-banner">
-              Easiest, highest-confidence call:
+              Easiest, highest-confidence call of {len(preds)}:
               {easiest['home_display']} vs {easiest['away_display']} —
               {easiest['best_label']} ({easiest['best_prob']*100:.1f}%, {easiest['confidence']} confidence).
-              The other fixture is closer: {other['best_label']} at {other['best_prob']*100:.1f}%.
+              {banner_extra}
             </div>
             """,
             unsafe_allow_html=True,
         )
 
-        col_a, col_b = st.columns(2)
-        with col_a:
-            render_prediction(preds[0], preds[0]["is_easiest"])
-        with col_b:
-            render_prediction(preds[1], preds[1]["is_easiest"])
+        st.markdown("**Ranked calls**")
+        st.dataframe(
+            [
+                {
+                    "Rank": i,
+                    "Match": f"{row['home_display']} vs {row['away_display']}",
+                    "Pick": row["best_label"],
+                    "Probability": f"{row['best_prob']*100:.1f}%",
+                    "Confidence": row["confidence"],
+                    "Expected score": f"{row['lambda_home']:.2f}–{row['lambda_away']:.2f}",
+                }
+                for i, row in enumerate(ranked, start=1)
+            ],
+            hide_index=True,
+            use_container_width=True,
+        )
+
+        for start in range(0, len(preds), 2):
+            cols = st.columns(2)
+            chunk = preds[start : start + 2]
+            for col, pred in zip(cols, chunk):
+                with col:
+                    render_prediction(pred, pred["is_easiest"])
 
 
 if __name__ == "__main__":

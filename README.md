@@ -13,7 +13,7 @@ py -m pip install -r requirements.txt
 py -m streamlit run app.py
 ```
 
-The app opens in your browser. Pick a club, whether that club is **home or away**, then the opponent — twice — and click **Predict both matches**.
+The app opens in your browser. Add as many fixtures as you want — pick a club, whether that club is **home or away**, then the opponent — and click **Predict**. The model ranks every selected match by how easy the call is.
 
 ## What the model uses
 
