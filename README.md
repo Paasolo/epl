@@ -13,10 +13,11 @@ py -m pip install -r requirements.txt
 py -m streamlit run app.py
 ```
 
-The app opens in your browser with two tabs:
+The app opens in your browser with three tabs:
 
-- **Predict matches** — load Matchweek 1 (or add/remove fixtures by hand), then click **Predict**. The model ranks every selected match by how easy the call is. Download the ranked slate as CSV or JSON.
+- **Predict matches** — load Matchweeks 1–4 (or add/remove fixtures by hand), toggle the summer overlay on/off, then click **Predict**. The model ranks every selected match and shows how much signings/coaching moved each pick. Download the ranked slate as CSV or JSON.
 - **Team strength** — Elo, attack/defence, recent form, manager, and promotion status for all 20 clubs.
+- **Backtest explorer** — walk-forward 2025/26 accuracy by confidence band, month, and biggest misses.
 
 ## What the model uses
 
@@ -25,7 +26,7 @@ The app opens in your browser with two tabs:
 - Elo strength blended with a Dixon–Coles Poisson score grid
 - Walk-forward **temperature calibration** on 2023/24–2025/26 so probabilities are not over-confident
 - Recent form, same-venue head-to-head, and a shrinkage prior for promoted clubs
-- 2026 summer context only: net spend, key ins/outs, manager changes, and a few club-specific shocks
+- 2026 summer context only: net spend, key ins/outs, manager changes, and a few club-specific shocks (optional overlay)
 
 The headline output is the most likely 1X2 result with a confidence band. Supporting markets (most likely score, over/under, BTTS) are shown when they are useful.
 

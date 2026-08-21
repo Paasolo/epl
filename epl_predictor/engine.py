@@ -273,7 +273,19 @@ class LeagueModel:
                     score_grid(float(np.clip(lam_h, 0.32, 3.6)), float(np.clip(lam_a, 0.26, 3.2)))
                 )
                 elo = elo_1x2(hs.elo, aws.elo)
-                holdout.append({"poisson": poisson, "elo": elo, "actual": result, "season": season})
+                holdout.append(
+                    {
+                        "poisson": poisson,
+                        "elo": elo,
+                        "actual": result,
+                        "season": season,
+                        "home": home,
+                        "away": away,
+                        "date": date,
+                        "hg": hg,
+                        "ag": ag,
+                    }
+                )
 
             lam_h, lam_a = self._rating_lambdas(home, away, date)
             lam_h = float(np.clip(lam_h, 0.25, 4.2))
@@ -529,7 +541,12 @@ class LeagueModel:
             "reasons_away": reasons_a,
         }
 
-    def predict_fixture(self, home_display: str, away_display: str) -> dict:
+    def predict_fixture(
+        self,
+        home_display: str,
+        away_display: str,
+        apply_context: bool = True,
+    ) -> dict:
         if not self._fitted:
             self.fit()
         if home_display not in CSV_NAME or away_display not in CSV_NAME:
@@ -538,7 +555,7 @@ class LeagueModel:
             raise ValueError("Home and away clubs must differ.")
         home_csv = CSV_NAME[home_display]
         away_csv = CSV_NAME[away_display]
-        raw = self._predict_from_states(home_csv, away_csv, AS_OF_KICKOFF, apply_context=True)
+        raw = self._predict_from_states(home_csv, away_csv, AS_OF_KICKOFF, apply_context=apply_context)
         raw["home_display"] = home_display
         raw["away_display"] = away_display
         raw["home_csv"] = home_csv
@@ -550,6 +567,7 @@ class LeagueModel:
         raw["h2h"] = self._h2h_table(home_csv, away_csv)
         raw["form_home"] = self._form_summary(home_csv)
         raw["form_away"] = self._form_summary(away_csv)
+        raw["apply_context"] = apply_context
         return raw
 
     def _form_summary(self, csv_name: str) -> dict:
@@ -645,6 +663,55 @@ class LeagueModel:
             "blend_w": self.blend_w,
         }
 
+    def backtest_rows(self, season: str = "2025/26") -> list[dict]:
+        """Calibrated walk-forward rows for the explorer UI."""
+        if not self._fitted:
+            self.fit()
+        rows = []
+        for row in self.backtest:
+            if season and row.get("season") != season:
+                continue
+            ph, pd_, pa = _temperature(_blend(row["poisson"], row["elo"], self.blend_w), self.temperature)
+            probs = {"H": ph, "D": pd_, "A": pa}
+            pred = max(probs, key=probs.get)
+            outcomes = sorted(probs.values(), reverse=True)
+            gap = outcomes[0] - outcomes[1]
+            if outcomes[0] >= 0.58 and gap >= 0.16:
+                confidence = "High"
+            elif outcomes[0] >= 0.47 and gap >= 0.08:
+                confidence = "Medium"
+            else:
+                confidence = "Low"
+            home = row.get("home", "")
+            away = row.get("away", "")
+            date = row.get("date")
+            rows.append(
+                {
+                    "date": pd.Timestamp(date) if date is not None else None,
+                    "month": pd.Timestamp(date).strftime("%Y-%m") if date is not None else "—",
+                    "home": DISPLAY_NAME.get(home, home),
+                    "away": DISPLAY_NAME.get(away, away),
+                    "match": f"{DISPLAY_NAME.get(home, home)} vs {DISPLAY_NAME.get(away, away)}",
+                    "actual": row["actual"],
+                    "predicted": pred,
+                    "correct": pred == row["actual"],
+                    "confidence": confidence,
+                    "p_home": ph,
+                    "p_draw": pd_,
+                    "p_away": pa,
+                    "best_prob": outcomes[0],
+                    "gap": gap,
+                    "hg": row.get("hg"),
+                    "ag": row.get("ag"),
+                    "score": (
+                        f"{row['hg']}-{row['ag']}"
+                        if row.get("hg") is not None and row.get("ag") is not None
+                        else "—"
+                    ),
+                }
+            )
+        return rows
+
     def snapshot(self, display_name: str) -> dict:
         csv_name = CSV_NAME[display_name]
         st = self.states[csv_name]
@@ -674,9 +741,9 @@ def get_model() -> LeagueModel:
     if CACHE_PATH.exists():
         try:
             model = pickle.loads(CACHE_PATH.read_bytes())
-            if getattr(model, "_fitted", False):
+            if getattr(model, "_fitted", False) and model.backtest and "home" in model.backtest[0]:
                 return model
-        except (OSError, pickle.UnpicklingError, AttributeError, TypeError):
+        except (OSError, pickle.UnpicklingError, AttributeError, TypeError, IndexError, KeyError):
             pass
     model = LeagueModel(load_matches())
     model.fit()

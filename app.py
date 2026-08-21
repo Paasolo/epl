@@ -180,11 +180,18 @@ def load_matchweek_into_state(gw: int) -> None:
         st.session_state[f"opp_{mid}"] = away
     st.session_state.pop("last_predictions", None)
     st.session_state.pop("last_ranked_table", None)
+    st.session_state.pop("last_ranked", None)
+    st.session_state.pop("last_apply_context", None)
 
 
 def ranked_table_rows(ranked: list[dict]) -> list[dict]:
     rows = []
     for i, row in enumerate(ranked, start=1):
+        alt = row.get("alt") or {}
+        code = row["best_code"]
+        key = {"H": "p_home", "D": "p_draw", "A": "p_away"}[code]
+        overlay_p = row[key]
+        history_p = alt.get(key, overlay_p)
         rows.append(
             {
                 "Rank": i,
@@ -203,6 +210,9 @@ def ranked_table_rows(ranked: list[dict]) -> list[dict]:
                 "Most likely score": row["top_scores"][0]["score"],
                 "BTTS %": round(row["p_btts"] * 100, 1),
                 "Over 2.5 %": round(row["p_over25"] * 100, 1),
+                "History-only pick": alt.get("best_label", "—"),
+                "History-only %": round(alt.get("best_prob", 0) * 100, 1) if alt else None,
+                "Overlay effect (pp)": round((overlay_p - history_p) * 100, 1) if alt else 0.0,
             }
         )
     return rows
@@ -231,6 +241,17 @@ def render_prediction(pred: dict, easiest: bool) -> None:
 
     easiest_html = '<span class="chip hot">Easiest call in this set</span>' if easiest else ""
     chip_html = "".join(f'<span class="chip">{c}</span>' for c in chips) + easiest_html
+    if pred.get("alt"):
+        alt = pred["alt"]
+        code = pred["best_code"]
+        key = {"H": "p_home", "D": "p_draw", "A": "p_away"}[code]
+        delta = (pred[key] - alt[key]) * 100
+        sign = "+" if delta >= 0 else ""
+        mode = "with summer overlay" if pred.get("apply_context", True) else "history only"
+        chip_html += (
+            f'<span class="chip">View: {mode}</span>'
+            f'<span class="chip">Overlay vs history on pick: {sign}{delta:.1f}pp</span>'
+        )
 
     pick_team = {
         "H": pred["home_display"],
@@ -392,6 +413,122 @@ def render_team_board(model) -> None:
     )
 
 
+def render_backtest_tab(model) -> None:
+    st.subheader("Backtest explorer")
+    st.caption(
+        "Walk-forward 2025/26 predictions: each match is scored using only earlier history, "
+        "then calibrated with the same blend and temperature used in the live app."
+    )
+    rows = model.backtest_rows("2025/26")
+    if not rows:
+        st.warning("No backtest rows available. Rebuild the model cache and try again.")
+        return
+
+    frame = pd.DataFrame(rows)
+    bt = model.backtest_summary()
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Matches", bt["n"])
+    m2.metric("Accuracy", f"{bt['accuracy']*100:.1f}%")
+    m3.metric("Log loss", f"{bt['log_loss']:.3f}")
+    m4.metric("High-conf hits", f"{bt['high_conf_acc']*100:.1f}%", f"n = {bt['high_conf_n']}")
+
+    st.markdown("**By confidence band**")
+    conf_rows = []
+    for band in ("High", "Medium", "Low"):
+        subset = frame[frame["confidence"] == band]
+        if subset.empty:
+            continue
+        conf_rows.append(
+            {
+                "Confidence": band,
+                "Matches": len(subset),
+                "Accuracy": f"{subset['correct'].mean()*100:.1f}%",
+                "Avg pick %": f"{subset['best_prob'].mean()*100:.1f}%",
+            }
+        )
+    st.dataframe(pd.DataFrame(conf_rows), hide_index=True, use_container_width=True)
+
+    st.markdown("**Home vs away correctness**")
+    ha_rows = [
+        {
+            "Side": "Home wins predicted",
+            "Matches": int((frame["predicted"] == "H").sum()),
+            "Accuracy": f"{frame.loc[frame['predicted'] == 'H', 'correct'].mean()*100:.1f}%",
+        },
+        {
+            "Side": "Draws predicted",
+            "Matches": int((frame["predicted"] == "D").sum()),
+            "Accuracy": f"{frame.loc[frame['predicted'] == 'D', 'correct'].mean()*100:.1f}%",
+        },
+        {
+            "Side": "Away wins predicted",
+            "Matches": int((frame["predicted"] == "A").sum()),
+            "Accuracy": f"{frame.loc[frame['predicted'] == 'A', 'correct'].mean()*100:.1f}%",
+        },
+    ]
+    st.dataframe(pd.DataFrame(ha_rows), hide_index=True, use_container_width=True)
+
+    st.markdown("**Accuracy by month**")
+    month = (
+        frame.groupby("month", dropna=False)
+        .agg(matches=("correct", "size"), accuracy=("correct", "mean"))
+        .reset_index()
+    )
+    month["accuracy"] = (month["accuracy"] * 100).round(1)
+    month = month.rename(columns={"month": "Month", "matches": "Matches", "accuracy": "Accuracy %"})
+    st.dataframe(month, hide_index=True, use_container_width=True)
+
+    chart = go.Figure(
+        go.Bar(
+            x=month["Month"],
+            y=month["Accuracy %"],
+            marker_color=TEAL,
+            text=month["Accuracy %"].map(lambda v: f"{v:.1f}%"),
+            textposition="outside",
+        )
+    )
+    chart.update_layout(
+        height=280,
+        margin=dict(l=10, r=10, t=20, b=40),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        yaxis=dict(range=[0, 100], ticksuffix="%", gridcolor=LINE, color=MUTED, title="Accuracy %"),
+        xaxis=dict(color=MUTED, title="Month"),
+        font=dict(color=TEXT),
+    )
+    st.plotly_chart(chart, use_container_width=True, key="backtest_month_chart")
+
+    st.markdown("**Biggest misses** (wrong calls with the highest model probability)")
+    misses = frame.loc[~frame["correct"]].sort_values("best_prob", ascending=False).head(15)
+    miss_view = pd.DataFrame(
+        {
+            "Date": [
+                d.strftime("%d %b %Y") if pd.notna(d) else "—" for d in misses["date"]
+            ],
+            "Match": misses["match"].to_list(),
+            "Score": misses["score"].to_list(),
+            "Predicted": misses["predicted"].map({"H": "Home", "D": "Draw", "A": "Away"}).to_list(),
+            "Actual": misses["actual"].map({"H": "Home", "D": "Draw", "A": "Away"}).to_list(),
+            "Model %": (misses["best_prob"] * 100).round(1).to_list(),
+            "Confidence": misses["confidence"].to_list(),
+        }
+    )
+    st.dataframe(miss_view, hide_index=True, use_container_width=True)
+
+    export = frame.copy()
+    export["date"] = export["date"].map(lambda d: d.strftime("%Y-%m-%d") if pd.notna(d) else "")
+    csv_buf = StringIO()
+    export.to_csv(csv_buf, index=False)
+    st.download_button(
+        "Download 2025/26 backtest rows (CSV)",
+        data=csv_buf.getvalue(),
+        file_name="epl_backtest_2025_26.csv",
+        mime="text/csv",
+        use_container_width=True,
+        key="dl_backtest",
+    )
+
+
 def render_predict_tab(model) -> None:
     teams = PREMIER_LEAGUE_2026_27
     labels = {t: team_label(t) for t in teams}
@@ -404,6 +541,13 @@ def render_predict_tab(model) -> None:
     st.caption(
         "Load an official matchweek, or build a custom slate. "
         "Choose a club, home or away, then the opponent."
+    )
+
+    apply_context = st.toggle(
+        "Apply summer signings & coaching overlay",
+        value=True,
+        help="When on, 2026 transfer and manager adjustments are applied. "
+        "Turn off for a history-only lean. The ranked table always shows the overlay effect.",
     )
 
     gw_labels = matchweek_options()
@@ -470,6 +614,8 @@ def render_predict_tab(model) -> None:
                 st.session_state.match_ids = [mid for mid in st.session_state.match_ids if mid != match_id]
                 st.session_state.pop("last_predictions", None)
                 st.session_state.pop("last_ranked_table", None)
+                st.session_state.pop("last_ranked", None)
+                st.session_state.pop("last_apply_context", None)
                 st.rerun()
         home, away = resolve_fixture(club, venue, opponent)
         st.caption(f"Fixture: **{home}** vs **{away}**")
@@ -498,9 +644,19 @@ def render_predict_tab(model) -> None:
             return
         preds = []
         for match_id, home, away in fixtures:
-            pred = model.predict_fixture(home, away)
-            pred["slot_id"] = match_id
-            preds.append(pred)
+            primary = model.predict_fixture(home, away, apply_context=apply_context)
+            alternate = model.predict_fixture(home, away, apply_context=not apply_context)
+            primary["slot_id"] = match_id
+            primary["alt"] = {
+                "best_label": alternate["best_label"],
+                "best_prob": alternate["best_prob"],
+                "best_code": alternate["best_code"],
+                "p_home": alternate["p_home"],
+                "p_draw": alternate["p_draw"],
+                "p_away": alternate["p_away"],
+                "apply_context": alternate["apply_context"],
+            }
+            preds.append(primary)
         ranked = ranked_picks(preds)
         easiest_id = id(ranked[0])
         for pred in preds:
@@ -509,6 +665,7 @@ def render_predict_tab(model) -> None:
         st.session_state.last_predictions = preds
         st.session_state.last_ranked = ranked
         st.session_state.last_ranked_table = table_rows
+        st.session_state.last_apply_context = apply_context
 
     preds = st.session_state.get("last_predictions")
     ranked = st.session_state.get("last_ranked")
@@ -516,11 +673,10 @@ def render_predict_tab(model) -> None:
     if not preds or not ranked or not table_rows:
         return
 
-    # Drop stale results if the current form no longer matches the last run.
     current_keys = {(h, a) for _, h, a in fixtures}
     predicted_keys = {(p["home_display"], p["away_display"]) for p in preds}
-    if current_keys != predicted_keys:
-        st.info("Fixtures changed since the last prediction. Click Predict again to refresh the slate.")
+    if current_keys != predicted_keys or st.session_state.get("last_apply_context") != apply_context:
+        st.info("Fixtures or overlay setting changed since the last prediction. Click Predict again to refresh.")
         return
 
     easiest = ranked[0]
@@ -533,10 +689,11 @@ def render_predict_tab(model) -> None:
         )
         banner_extra = f" Next in the ranking: {runners}."
 
+    mode_note = "summer overlay on" if apply_context else "history only"
     st.markdown(
         f"""
         <div class="easy-banner">
-          Easiest, highest-confidence call of {len(preds)}:
+          Easiest, highest-confidence call of {len(preds)} ({mode_note}):
           {easiest['home_display']} vs {easiest['away_display']} —
           {easiest['best_label']} ({easiest['best_prob']*100:.1f}%, {easiest['confidence']} confidence).
           {banner_extra}
@@ -552,11 +709,18 @@ def render_predict_tab(model) -> None:
         "Pick",
         "Probability",
         "Confidence",
+        "History-only pick",
+        "History-only %",
+        "Overlay effect (pp)",
         "Expected home xG",
         "Expected away xG",
         "Most likely score",
     ]
     st.dataframe(pd.DataFrame(table_rows)[display_cols], hide_index=True, use_container_width=True)
+    st.caption(
+        "Overlay effect is the change in probability for the current pick versus the history-only model "
+        "(positive means summer context made that pick more likely)."
+    )
 
     csv_text, json_text = export_bytes(table_rows)
     dl1, dl2 = st.columns(2)
@@ -596,8 +760,8 @@ def main() -> None:
           <h1>Premier League match predictor</h1>
           <p>Load an official matchweek or build a custom slate. The model is fitted on every
           Premier League match in <code>epl_final.csv</code> (2000/01–2025/26), then adjusted for
-          this summer’s signings and coaching changes. It ranks the most likely 1X2 results and
-          flags the easiest, highest-confidence calls.</p>
+          this summer’s signings and coaching changes. Compare history-only vs overlay leanings,
+          inspect team strength, and review the 2025/26 walk-forward backtest.</p>
         </div>
         """,
         unsafe_allow_html=True,
@@ -606,11 +770,15 @@ def main() -> None:
     with st.sidebar:
         render_sidebar(model)
 
-    tab_predict, tab_teams = st.tabs(["Predict matches", "Team strength"])
+    tab_predict, tab_teams, tab_backtest = st.tabs(
+        ["Predict matches", "Team strength", "Backtest explorer"]
+    )
     with tab_predict:
         render_predict_tab(model)
     with tab_teams:
         render_team_board(model)
+    with tab_backtest:
+        render_backtest_tab(model)
 
 
 if __name__ == "__main__":
