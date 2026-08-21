@@ -39,6 +39,8 @@ from .context import (
 
 DATA_PATH = Path(__file__).resolve().parent.parent / "epl_final.csv"
 CACHE_PATH = Path(__file__).resolve().parent / "model_cache.pkl"
+# Bump when the pickled model schema or public API changes.
+MODEL_API_VERSION = 3
 
 ELO_MEAN = 1500.0
 ELO_HFA = 62.0
@@ -667,50 +669,7 @@ class LeagueModel:
         """Calibrated walk-forward rows for the explorer UI."""
         if not self._fitted:
             self.fit()
-        rows = []
-        for row in self.backtest:
-            if season and row.get("season") != season:
-                continue
-            ph, pd_, pa = _temperature(_blend(row["poisson"], row["elo"], self.blend_w), self.temperature)
-            probs = {"H": ph, "D": pd_, "A": pa}
-            pred = max(probs, key=probs.get)
-            outcomes = sorted(probs.values(), reverse=True)
-            gap = outcomes[0] - outcomes[1]
-            if outcomes[0] >= 0.58 and gap >= 0.16:
-                confidence = "High"
-            elif outcomes[0] >= 0.47 and gap >= 0.08:
-                confidence = "Medium"
-            else:
-                confidence = "Low"
-            home = row.get("home", "")
-            away = row.get("away", "")
-            date = row.get("date")
-            rows.append(
-                {
-                    "date": pd.Timestamp(date) if date is not None else None,
-                    "month": pd.Timestamp(date).strftime("%Y-%m") if date is not None else "—",
-                    "home": DISPLAY_NAME.get(home, home),
-                    "away": DISPLAY_NAME.get(away, away),
-                    "match": f"{DISPLAY_NAME.get(home, home)} vs {DISPLAY_NAME.get(away, away)}",
-                    "actual": row["actual"],
-                    "predicted": pred,
-                    "correct": pred == row["actual"],
-                    "confidence": confidence,
-                    "p_home": ph,
-                    "p_draw": pd_,
-                    "p_away": pa,
-                    "best_prob": outcomes[0],
-                    "gap": gap,
-                    "hg": row.get("hg"),
-                    "ag": row.get("ag"),
-                    "score": (
-                        f"{row['hg']}-{row['ag']}"
-                        if row.get("hg") is not None and row.get("ag") is not None
-                        else "—"
-                    ),
-                }
-            )
-        return rows
+        return build_backtest_rows(self, season)
 
     def snapshot(self, display_name: str) -> dict:
         csv_name = CSV_NAME[display_name]
@@ -729,9 +688,82 @@ class LeagueModel:
         }
 
 
+def build_backtest_rows(model: LeagueModel, season: str = "2025/26") -> list[dict]:
+    """Calibrated walk-forward rows for the explorer UI.
+
+    Module-level so Streamlit Cloud keeps working even if a stale cached
+    model instance was created before LeagueModel.backtest_rows existed.
+    """
+    if not getattr(model, "_fitted", False):
+        model.fit()
+    blend_w = float(getattr(model, "blend_w", 0.72))
+    temperature = float(getattr(model, "temperature", 1.0))
+    rows = []
+    for row in getattr(model, "backtest", []) or []:
+        if season and row.get("season") != season:
+            continue
+        if "poisson" not in row or "elo" not in row or "actual" not in row:
+            continue
+        ph, pd_, pa = _temperature(_blend(row["poisson"], row["elo"], blend_w), temperature)
+        probs = {"H": ph, "D": pd_, "A": pa}
+        pred = max(probs, key=probs.get)
+        outcomes = sorted(probs.values(), reverse=True)
+        gap = outcomes[0] - outcomes[1]
+        if outcomes[0] >= 0.58 and gap >= 0.16:
+            confidence = "High"
+        elif outcomes[0] >= 0.47 and gap >= 0.08:
+            confidence = "Medium"
+        else:
+            confidence = "Low"
+        home = row.get("home", "")
+        away = row.get("away", "")
+        date = row.get("date")
+        month = "—"
+        parsed_date = None
+        if date is not None:
+            parsed_date = pd.Timestamp(date)
+            month = parsed_date.strftime("%Y-%m")
+        rows.append(
+            {
+                "date": parsed_date,
+                "month": month,
+                "home": DISPLAY_NAME.get(home, home),
+                "away": DISPLAY_NAME.get(away, away),
+                "match": f"{DISPLAY_NAME.get(home, home)} vs {DISPLAY_NAME.get(away, away)}",
+                "actual": row["actual"],
+                "predicted": pred,
+                "correct": pred == row["actual"],
+                "confidence": confidence,
+                "p_home": ph,
+                "p_draw": pd_,
+                "p_away": pa,
+                "best_prob": outcomes[0],
+                "gap": gap,
+                "hg": row.get("hg"),
+                "ag": row.get("ag"),
+                "score": (
+                    f"{row['hg']}-{row['ag']}"
+                    if row.get("hg") is not None and row.get("ag") is not None
+                    else "—"
+                ),
+            }
+        )
+    return rows
+
+
 def _write_cache(model: LeagueModel) -> None:
     try:
+        model.api_version = MODEL_API_VERSION
         CACHE_PATH.write_bytes(pickle.dumps(model, protocol=pickle.HIGHEST_PROTOCOL))
+    except OSError:
+        pass
+
+
+def clear_model_cache() -> None:
+    get_model.cache_clear()
+    try:
+        if CACHE_PATH.exists():
+            CACHE_PATH.unlink()
     except OSError:
         pass
 
@@ -741,12 +773,16 @@ def get_model() -> LeagueModel:
     if CACHE_PATH.exists():
         try:
             model = pickle.loads(CACHE_PATH.read_bytes())
-            if getattr(model, "_fitted", False) and model.backtest and "home" in model.backtest[0]:
+            version_ok = getattr(model, "api_version", 0) == MODEL_API_VERSION
+            schema_ok = bool(model.backtest) and "home" in model.backtest[0]
+            fitted_ok = getattr(model, "_fitted", False)
+            if fitted_ok and version_ok and schema_ok:
                 return model
         except (OSError, pickle.UnpicklingError, AttributeError, TypeError, IndexError, KeyError):
             pass
     model = LeagueModel(load_matches())
     model.fit()
+    model.api_version = MODEL_API_VERSION
     _write_cache(model)
     return model
 

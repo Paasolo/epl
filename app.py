@@ -10,7 +10,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from epl_predictor.context import PREMIER_LEAGUE_2026_27, PROMOTED_TEAMS, TEAM_CONTEXT
-from epl_predictor.engine import get_model, ranked_picks
+from epl_predictor.engine import MODEL_API_VERSION, build_backtest_rows, clear_model_cache, get_model, ranked_picks
 from epl_predictor.fixtures import fixtures_for, matchweek_options
 
 st.set_page_config(
@@ -114,7 +114,9 @@ st.markdown(
 
 
 @st.cache_resource(show_spinner="Loading calibrated Premier League ratings…")
-def load_fitted_model():
+def load_fitted_model(api_version: int = MODEL_API_VERSION):
+    # api_version is part of the cache key so Cloud rebuilds after model API bumps.
+    _ = api_version
     return get_model()
 
 
@@ -419,9 +421,23 @@ def render_backtest_tab(model) -> None:
         "Walk-forward 2025/26 predictions: each match is scored using only earlier history, "
         "then calibrated with the same blend and temperature used in the live app."
     )
-    rows = model.backtest_rows("2025/26")
+    try:
+        rows = build_backtest_rows(model, "2025/26")
+    except Exception as exc:  # noqa: BLE001 — show a clean recovery path in the UI
+        st.error(f"Could not build backtest rows ({type(exc).__name__}). Rebuilding model cache…")
+        clear_model_cache()
+        load_fitted_model.clear()
+        model = load_fitted_model()
+        rows = build_backtest_rows(model, "2025/26")
     if not rows:
-        st.warning("No backtest rows available. Rebuild the model cache and try again.")
+        st.warning(
+            "No enriched backtest rows yet. Click below to rebuild the model "
+            "(needed once after upgrading the app)."
+        )
+        if st.button("Rebuild model cache", type="primary"):
+            clear_model_cache()
+            load_fitted_model.clear()
+            st.rerun()
         return
 
     frame = pd.DataFrame(rows)
