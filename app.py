@@ -94,7 +94,7 @@ st.markdown(
 )
 
 
-@st.cache_resource(show_spinner="Fitting ratings on 2000–2026 Premier League matches…")
+@st.cache_resource(show_spinner="Loading calibrated Premier League ratings…")
 def load_fitted_model():
     return get_model()
 
@@ -247,16 +247,17 @@ def main() -> None:
     with st.sidebar:
         st.header("Model card")
         st.write(
-            "Ratings walk through 9,700+ historical matches: Elo strength, "
-            "attack/defence Poisson ratings, home advantage, recent form, shots on target, "
-            "and head-to-head. Promoted clubs are shrunk toward a Championship-to-PL prior."
+            "Walk-forward ensemble: shots-based xG ratings, Dixon–Coles Poisson, "
+            "Elo 1X2, season mean-reversion, and temperature calibration on the last "
+            "three Premier League seasons. Summer 2026 signings and coaching changes "
+            "are a capped overlay. Promoted clubs are shrunk toward a Championship prior."
         )
-        st.metric("2025/26 walk-forward accuracy", f"{bt['accuracy']*100:.1f}%", help="Predicted 1X2 before each 2025/26 match was played, using only earlier data.")
+        st.metric("2025/26 walk-forward accuracy", f"{bt['accuracy']*100:.1f}%", help="Predicted 1X2 before each 2025/26 match, using only earlier data.")
         st.metric("High-confidence hits", f"{bt['high_conf_acc']*100:.1f}%", f"n = {bt['high_conf_n']}")
         st.caption(
-            f"Log loss {bt['log_loss']:.3f} on {bt['n']} matches. "
-            "A naive always-home-win rule is about 46%. Football 1X2 is noisy — "
-            "treat High confidence as the only range worth leaning on."
+            f"Log loss {bt['log_loss']:.3f} · Brier {bt.get('brier', 0):.3f} on {bt['n']} matches. "
+            f"Calibration T={bt.get('temperature', 1):.2f}, Poisson weight={bt.get('blend_w', 0.7):.2f}. "
+            "A naive always-home-win rule is about 46%. Lean on High confidence calls."
         )
         st.divider()
         st.caption(

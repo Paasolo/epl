@@ -17,12 +17,13 @@ The app opens in your browser. Pick a club, whether that club is **home or away*
 
 ## What the model uses
 
-- Historical results, goals, shots and shots on target
-- Elo strength and attack/defence Poisson ratings with home advantage
-- Recent form and Premier League head-to-head
-- A shrinkage prior for promoted clubs (Coventry City, Ipswich Town, Hull City)
-- 2026 summer context only: net spend, key ins/outs, manager changes, and a few club-specific shocks (for example Salah leaving Liverpool, or Guardiola leaving Manchester City)
+- Historical results plus a shots-on-target **xG proxy** (less noisy than raw goals)
+- Time-decayed attack/defence ratings with learned home advantage and season carry-over
+- Elo strength blended with a Dixon–Coles Poisson score grid
+- Walk-forward **temperature calibration** on 2023/24–2025/26 so probabilities are not over-confident
+- Recent form, same-venue head-to-head, and a shrinkage prior for promoted clubs
+- 2026 summer context only: net spend, key ins/outs, manager changes, and a few club-specific shocks
 
-The headline output is the most likely 1X2 result with a confidence band. Supporting markets (most likely score, over/under, BTTS) are shown only when they are useful. When two fixtures are selected, the app ranks which one is the easier, higher-confidence call.
+The headline output is the most likely 1X2 result with a confidence band. Supporting markets (most likely score, over/under, BTTS) are shown when they are useful. When two fixtures are selected, the app ranks which one is the easier, higher-confidence call.
 
 Football match outcomes are noisy. Lean on **High** confidence picks; treat Low as little more than a lean.
