@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
-import streamlit as st
-import plotly.graph_objects as go
+import json
+from io import StringIO
 
-from epl_predictor.context import PREMIER_LEAGUE_2026_27, PROMOTED_TEAMS
+import pandas as pd
+import plotly.graph_objects as go
+import streamlit as st
+
+from epl_predictor.context import PREMIER_LEAGUE_2026_27, PROMOTED_TEAMS, TEAM_CONTEXT
 from epl_predictor.engine import get_model, ranked_picks
+from epl_predictor.fixtures import fixtures_for, matchweek_options
 
 st.set_page_config(
     page_title="EPL Match Predictor 2026/27",
@@ -25,6 +30,20 @@ DRAW_C = "#C9A227"
 AWAY_C = "#E45757"
 TEXT = "#E8EEF7"
 MUTED = "#93A0B5"
+
+MAX_MATCHES = 10
+DEFAULT_FIXTURES = [
+    ("Arsenal", "Home", "Coventry City"),
+    ("Manchester United", "Away", "Hull City"),
+    ("Newcastle United", "Home", "Liverpool"),
+    ("Manchester City", "Home", "AFC Bournemouth"),
+    ("Fulham", "Home", "Chelsea"),
+    ("Brentford", "Home", "Tottenham Hotspur"),
+    ("Brighton & Hove Albion", "Home", "Aston Villa"),
+    ("Ipswich Town", "Home", "Sunderland"),
+    ("Nottingham Forest", "Home", "Leeds United"),
+    ("Everton", "Home", "Crystal Palace"),
+]
 
 st.markdown(
     f"""
@@ -105,21 +124,6 @@ def team_label(name: str) -> str:
     return name
 
 
-MAX_MATCHES = 10
-DEFAULT_FIXTURES = [
-    ("Arsenal", "Home", "Coventry City"),
-    ("Manchester United", "Away", "Hull City"),
-    ("Newcastle United", "Home", "Liverpool"),
-    ("Manchester City", "Home", "AFC Bournemouth"),
-    ("Fulham", "Home", "Chelsea"),
-    ("Brentford", "Home", "Tottenham Hotspur"),
-    ("Brighton & Hove Albion", "Home", "Aston Villa"),
-    ("Ipswich Town", "Home", "Sunderland"),
-    ("Nottingham Forest", "Home", "Leeds United"),
-    ("Everton", "Home", "Crystal Palace"),
-]
-
-
 def outcome_chart(pred: dict) -> go.Figure:
     labels = [
         f"{pred['home_display']} win",
@@ -156,6 +160,60 @@ def resolve_fixture(club: str, venue: str, opponent: str) -> tuple[str, str]:
     if venue == "Home":
         return club, opponent
     return opponent, club
+
+
+def clear_match_widget_keys(match_ids: list[int]) -> None:
+    for mid in match_ids:
+        for prefix in ("club_", "venue_", "opp_"):
+            st.session_state.pop(f"{prefix}{mid}", None)
+
+
+def load_matchweek_into_state(gw: int) -> None:
+    pairs = fixtures_for(gw)
+    clear_match_widget_keys(list(st.session_state.get("match_ids", [])))
+    new_ids = list(range(len(pairs)))
+    st.session_state.match_ids = new_ids
+    st.session_state.next_match_id = max(new_ids) + 1 if new_ids else 0
+    for mid, (home, away) in enumerate(pairs):
+        st.session_state[f"club_{mid}"] = home
+        st.session_state[f"venue_{mid}"] = "Home"
+        st.session_state[f"opp_{mid}"] = away
+    st.session_state.pop("last_predictions", None)
+    st.session_state.pop("last_ranked_table", None)
+
+
+def ranked_table_rows(ranked: list[dict]) -> list[dict]:
+    rows = []
+    for i, row in enumerate(ranked, start=1):
+        rows.append(
+            {
+                "Rank": i,
+                "Match": f"{row['home_display']} vs {row['away_display']}",
+                "Home": row["home_display"],
+                "Away": row["away_display"],
+                "Pick": row["best_label"],
+                "Pick code": row["best_code"],
+                "Probability": round(row["best_prob"] * 100, 1),
+                "Home win %": round(row["p_home"] * 100, 1),
+                "Draw %": round(row["p_draw"] * 100, 1),
+                "Away win %": round(row["p_away"] * 100, 1),
+                "Confidence": row["confidence"],
+                "Expected home xG": round(row["lambda_home"], 2),
+                "Expected away xG": round(row["lambda_away"], 2),
+                "Most likely score": row["top_scores"][0]["score"],
+                "BTTS %": round(row["p_btts"] * 100, 1),
+                "Over 2.5 %": round(row["p_over25"] * 100, 1),
+            }
+        )
+    return rows
+
+
+def export_bytes(rows: list[dict]) -> tuple[str, str]:
+    frame = pd.DataFrame(rows)
+    csv_buf = StringIO()
+    frame.to_csv(csv_buf, index=False)
+    json_text = json.dumps(rows, indent=2)
+    return csv_buf.getvalue(), json_text
 
 
 def render_prediction(pred: dict, easiest: bool) -> None:
@@ -221,7 +279,10 @@ def render_prediction(pred: dict, easiest: bool) -> None:
             st.markdown(f"**{pred['home_display']}** (home)")
             st.caption(f"Manager: {ctx_h['manager']}  ·  in charge since {ctx_h['manager_since']}")
             form = pred["form_home"]
-            st.write(f"Recent PL form: {form['sequence']}" + (f"  ({form['points']} pts from {form['played']})" if form["played"] else ""))
+            st.write(
+                f"Recent PL form: {form['sequence']}"
+                + (f"  ({form['points']} pts from {form['played']})" if form["played"] else "")
+            )
             st.write("Key arrivals:")
             st.write("\n".join(f"- {x}" for x in ctx_h["key_ins"][:5]) or "- None listed")
             st.write("Key departures:")
@@ -232,7 +293,10 @@ def render_prediction(pred: dict, easiest: bool) -> None:
             st.markdown(f"**{pred['away_display']}** (away)")
             st.caption(f"Manager: {ctx_a['manager']}  ·  in charge since {ctx_a['manager_since']}")
             form = pred["form_away"]
-            st.write(f"Recent PL form: {form['sequence']}" + (f"  ({form['points']} pts from {form['played']})" if form["played"] else ""))
+            st.write(
+                f"Recent PL form: {form['sequence']}"
+                + (f"  ({form['points']} pts from {form['played']})" if form["played"] else "")
+            )
             st.write("Key arrivals:")
             st.write("\n".join(f"- {x}" for x in ctx_a["key_ins"][:5]) or "- None listed")
             st.write("Key departures:")
@@ -246,45 +310,89 @@ def render_prediction(pred: dict, easiest: bool) -> None:
             st.caption("No recent Premier League head-to-head in the dataset.")
 
 
-def main() -> None:
-    model = load_fitted_model()
+def render_sidebar(model) -> None:
     bt = model.backtest_summary()
-
-    st.markdown(
-        """
-        <div class="hero">
-          <h1>Premier League match predictor</h1>
-          <p>Add as many 2026/27 fixtures as you want. The model is fitted on every Premier League
-          match in <code>epl_final.csv</code> (2000/01–2025/26), then adjusted for this summer’s
-          signings and coaching changes. It ranks the most likely 1X2 results and flags the
-          easiest, highest-confidence calls in the set.</p>
-        </div>
-        """,
-        unsafe_allow_html=True,
+    st.header("Model card")
+    st.write(
+        "Walk-forward ensemble: shots-based xG ratings, Dixon–Coles Poisson, "
+        "Elo 1X2, season mean-reversion, and temperature calibration on the last "
+        "three Premier League seasons. Summer 2026 signings and coaching changes "
+        "are a capped overlay. Promoted clubs are shrunk toward a Championship prior."
+    )
+    st.metric(
+        "2025/26 walk-forward accuracy",
+        f"{bt['accuracy']*100:.1f}%",
+        help="Predicted 1X2 before each 2025/26 match, using only earlier data.",
+    )
+    st.metric("High-confidence hits", f"{bt['high_conf_acc']*100:.1f}%", f"n = {bt['high_conf_n']}")
+    st.caption(
+        f"Log loss {bt['log_loss']:.3f} · Brier {bt.get('brier', 0):.3f} on {bt['n']} matches. "
+        f"Calibration T={bt.get('temperature', 1):.2f}, Poisson weight={bt.get('blend_w', 0.7):.2f}. "
+        "A naive always-home-win rule is about 46%. Lean on High confidence calls."
+    )
+    st.divider()
+    st.caption(
+        "Context sources (as of 20 Aug 2026): Premier League manager list, "
+        "ESPN summer transfer round-up, BBC, club announcements, Wikipedia 2026/27 season page. "
+        "The transfer window remains open until 1 September."
     )
 
-    with st.sidebar:
-        st.header("Model card")
-        st.write(
-            "Walk-forward ensemble: shots-based xG ratings, Dixon–Coles Poisson, "
-            "Elo 1X2, season mean-reversion, and temperature calibration on the last "
-            "three Premier League seasons. Summer 2026 signings and coaching changes "
-            "are a capped overlay. Promoted clubs are shrunk toward a Championship prior."
-        )
-        st.metric("2025/26 walk-forward accuracy", f"{bt['accuracy']*100:.1f}%", help="Predicted 1X2 before each 2025/26 match, using only earlier data.")
-        st.metric("High-confidence hits", f"{bt['high_conf_acc']*100:.1f}%", f"n = {bt['high_conf_n']}")
-        st.caption(
-            f"Log loss {bt['log_loss']:.3f} · Brier {bt.get('brier', 0):.3f} on {bt['n']} matches. "
-            f"Calibration T={bt.get('temperature', 1):.2f}, Poisson weight={bt.get('blend_w', 0.7):.2f}. "
-            "A naive always-home-win rule is about 46%. Lean on High confidence calls."
-        )
-        st.divider()
-        st.caption(
-            "Context sources (as of 20 Aug 2026): Premier League manager list, "
-            "ESPN summer transfer round-up, BBC, club announcements, Wikipedia 2026/27 season page. "
-            "The transfer window remains open until 1 September."
+
+def render_team_board(model) -> None:
+    st.subheader("Team strength board")
+    st.caption(
+        "Ratings after walking through every Premier League match in the dataset "
+        "(2000/01–2025/26), before summer 2026 context is applied to individual fixtures."
+    )
+
+    rows = []
+    for name in PREMIER_LEAGUE_2026_27:
+        snap = model.snapshot(name)
+        form = snap["form"]
+        ctx = TEAM_CONTEXT[name]
+        rows.append(
+            {
+                "Team": name,
+                "Elo": round(snap["elo"], 0),
+                "Attack": round(snap["attack"], 2),
+                "Defence": round(snap["defense"], 2),
+                "Last 6": form["sequence"],
+                "Form pts": form["points"] if form["played"] else "—",
+                "Last season": snap["position"],
+                "Manager": snap["manager"],
+                "Coach change": ctx["change_type"],
+                "Promoted": "Yes" if snap["promoted"] else "",
+                "Net spend £m": ctx["net_spend_m"],
+                "Last PL game": snap["last_date"],
+                "Career PL matches": snap["matches"],
+            }
         )
 
+    board = pd.DataFrame(rows).sort_values("Elo", ascending=False).reset_index(drop=True)
+    board.insert(0, "Rank", board.index + 1)
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Strongest Elo", board.iloc[0]["Team"], f"{board.iloc[0]['Elo']:.0f}")
+    c2.metric("Weakest Elo", board.iloc[-1]["Team"], f"{board.iloc[-1]['Elo']:.0f}")
+    promoted = board[board["Promoted"] == "Yes"]["Team"].tolist()
+    c3.metric("Promoted sides", str(len(promoted)), ", ".join(promoted) if promoted else "—")
+    summer_changes = int((board["Coach change"] == "summer").sum())
+    c4.metric("New summer coaches", summer_changes)
+
+    st.dataframe(board, hide_index=True, use_container_width=True, height=720)
+
+    csv_buf = StringIO()
+    board.to_csv(csv_buf, index=False)
+    st.download_button(
+        "Download team board (CSV)",
+        data=csv_buf.getvalue(),
+        file_name="epl_team_strength_board.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
+
+
+def render_predict_tab(model) -> None:
     teams = PREMIER_LEAGUE_2026_27
     labels = {t: team_label(t) for t in teams}
 
@@ -293,11 +401,27 @@ def main() -> None:
         st.session_state.next_match_id = 2
 
     st.subheader("Select matches")
-    st.caption("Choose a club, home or away, then the opponent. Add more fixtures to predict a full slate at once.")
+    st.caption(
+        "Load an official matchweek, or build a custom slate. "
+        "Choose a club, home or away, then the opponent."
+    )
 
-    add_col, _ = st.columns([1, 3])
-    with add_col:
-        if st.button("Add match", disabled=len(st.session_state.match_ids) >= MAX_MATCHES, use_container_width=True):
+    gw_labels = matchweek_options()
+    load_c1, load_c2, load_c3 = st.columns([2.4, 1.2, 1.2])
+    with load_c1:
+        gw_label = st.selectbox("Official matchweek", list(gw_labels.keys()), key="gw_select")
+    with load_c2:
+        st.markdown("<div style='height: 1.7rem'></div>", unsafe_allow_html=True)
+        if st.button("Load matchweek", use_container_width=True, type="secondary"):
+            load_matchweek_into_state(gw_labels[gw_label])
+            st.rerun()
+    with load_c3:
+        st.markdown("<div style='height: 1.7rem'></div>", unsafe_allow_html=True)
+        if st.button(
+            "Add match",
+            disabled=len(st.session_state.match_ids) >= MAX_MATCHES,
+            use_container_width=True,
+        ):
             st.session_state.match_ids.append(st.session_state.next_match_id)
             st.session_state.next_match_id += 1
             st.rerun()
@@ -309,35 +433,43 @@ def main() -> None:
         st.markdown(f"**Match {idx + 1}**")
         c1, c2, c3, c4 = st.columns([2.2, 1.2, 2.2, 0.7])
         with c1:
+            club_key = f"club_{match_id}"
+            if club_key not in st.session_state:
+                st.session_state[club_key] = club_default
             club = st.selectbox(
                 "Club",
                 teams,
-                index=teams.index(club_default),
                 format_func=lambda t: labels[t],
-                key=f"club_{match_id}",
+                key=club_key,
             )
         with c2:
+            venue_key = f"venue_{match_id}"
+            if venue_key not in st.session_state:
+                st.session_state[venue_key] = venue_default
             venue = st.radio(
                 "This club is playing",
                 ["Home", "Away"],
-                index=0 if venue_default == "Home" else 1,
                 horizontal=True,
-                key=f"venue_{match_id}",
+                key=venue_key,
             )
         with c3:
             opps = [t for t in teams if t != club]
-            opp_index = opps.index(opp_default) if opp_default in opps else 0
+            opp_key = f"opp_{match_id}"
+            if opp_key not in st.session_state or st.session_state[opp_key] not in opps:
+                st.session_state[opp_key] = opp_default if opp_default in opps else opps[0]
             opponent = st.selectbox(
                 "Opponent",
                 opps,
-                index=opp_index,
                 format_func=lambda t: labels[t],
-                key=f"opp_{match_id}",
+                key=opp_key,
             )
         with c4:
             st.markdown("<div style='height: 1.7rem'></div>", unsafe_allow_html=True)
             if st.button("Remove", disabled=len(ids) <= 1, key=f"remove_{match_id}", use_container_width=True):
+                clear_match_widget_keys([match_id])
                 st.session_state.match_ids = [mid for mid in st.session_state.match_ids if mid != match_id]
+                st.session_state.pop("last_predictions", None)
+                st.session_state.pop("last_ranked_table", None)
                 st.rerun()
         home, away = resolve_fixture(club, venue, opponent)
         st.caption(f"Fixture: **{home}** vs **{away}**")
@@ -351,7 +483,11 @@ def main() -> None:
             duplicates.append(f"{home} vs {away}")
         seen[key] = match_id
     if duplicates:
-        st.warning("Duplicate fixture in the list: " + ", ".join(sorted(set(duplicates))) + ". Remove one copy so the ranking stays clean.")
+        st.warning(
+            "Duplicate fixture in the list: "
+            + ", ".join(sorted(set(duplicates)))
+            + ". Remove one copy so the ranking stays clean."
+        )
 
     n = len(fixtures)
     run = st.button(f"Predict {n} match{'es' if n != 1 else ''}", type="primary", use_container_width=True)
@@ -366,55 +502,115 @@ def main() -> None:
             pred["slot_id"] = match_id
             preds.append(pred)
         ranked = ranked_picks(preds)
-        easiest = ranked[0]
-        easiest_ids = {id(ranked[0])}
+        easiest_id = id(ranked[0])
         for pred in preds:
-            pred["is_easiest"] = id(pred) in easiest_ids
+            pred["is_easiest"] = id(pred) == easiest_id
+        table_rows = ranked_table_rows(ranked)
+        st.session_state.last_predictions = preds
+        st.session_state.last_ranked = ranked
+        st.session_state.last_ranked_table = table_rows
 
-        if len(ranked) == 1:
-            banner_extra = ""
-        else:
-            runners = "; ".join(
-                f"{row['home_display']} vs {row['away_display']} — {row['best_label']} ({row['best_prob']*100:.1f}%)"
-                for row in ranked[1:3]
-            )
-            banner_extra = f" Next in the ranking: {runners}."
+    preds = st.session_state.get("last_predictions")
+    ranked = st.session_state.get("last_ranked")
+    table_rows = st.session_state.get("last_ranked_table")
+    if not preds or not ranked or not table_rows:
+        return
 
-        st.markdown(
-            f"""
-            <div class="easy-banner">
-              Easiest, highest-confidence call of {len(preds)}:
-              {easiest['home_display']} vs {easiest['away_display']} —
-              {easiest['best_label']} ({easiest['best_prob']*100:.1f}%, {easiest['confidence']} confidence).
-              {banner_extra}
-            </div>
-            """,
-            unsafe_allow_html=True,
+    # Drop stale results if the current form no longer matches the last run.
+    current_keys = {(h, a) for _, h, a in fixtures}
+    predicted_keys = {(p["home_display"], p["away_display"]) for p in preds}
+    if current_keys != predicted_keys:
+        st.info("Fixtures changed since the last prediction. Click Predict again to refresh the slate.")
+        return
+
+    easiest = ranked[0]
+    if len(ranked) == 1:
+        banner_extra = ""
+    else:
+        runners = "; ".join(
+            f"{row['home_display']} vs {row['away_display']} — {row['best_label']} ({row['best_prob']*100:.1f}%)"
+            for row in ranked[1:3]
         )
+        banner_extra = f" Next in the ranking: {runners}."
 
-        st.markdown("**Ranked calls**")
-        st.dataframe(
-            [
-                {
-                    "Rank": i,
-                    "Match": f"{row['home_display']} vs {row['away_display']}",
-                    "Pick": row["best_label"],
-                    "Probability": f"{row['best_prob']*100:.1f}%",
-                    "Confidence": row["confidence"],
-                    "Expected score": f"{row['lambda_home']:.2f}–{row['lambda_away']:.2f}",
-                }
-                for i, row in enumerate(ranked, start=1)
-            ],
-            hide_index=True,
+    st.markdown(
+        f"""
+        <div class="easy-banner">
+          Easiest, highest-confidence call of {len(preds)}:
+          {easiest['home_display']} vs {easiest['away_display']} —
+          {easiest['best_label']} ({easiest['best_prob']*100:.1f}%, {easiest['confidence']} confidence).
+          {banner_extra}
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    st.markdown("**Ranked calls**")
+    display_cols = [
+        "Rank",
+        "Match",
+        "Pick",
+        "Probability",
+        "Confidence",
+        "Expected home xG",
+        "Expected away xG",
+        "Most likely score",
+    ]
+    st.dataframe(pd.DataFrame(table_rows)[display_cols], hide_index=True, use_container_width=True)
+
+    csv_text, json_text = export_bytes(table_rows)
+    dl1, dl2 = st.columns(2)
+    with dl1:
+        st.download_button(
+            "Download ranked slate (CSV)",
+            data=csv_text,
+            file_name="epl_ranked_predictions.csv",
+            mime="text/csv",
             use_container_width=True,
+            key="dl_csv",
+        )
+    with dl2:
+        st.download_button(
+            "Download ranked slate (JSON)",
+            data=json_text,
+            file_name="epl_ranked_predictions.json",
+            mime="application/json",
+            use_container_width=True,
+            key="dl_json",
         )
 
-        for start in range(0, len(preds), 2):
-            cols = st.columns(2)
-            chunk = preds[start : start + 2]
-            for col, pred in zip(cols, chunk):
-                with col:
-                    render_prediction(pred, pred["is_easiest"])
+    for start in range(0, len(preds), 2):
+        cols = st.columns(2)
+        chunk = preds[start : start + 2]
+        for col, pred in zip(cols, chunk):
+            with col:
+                render_prediction(pred, pred["is_easiest"])
+
+
+def main() -> None:
+    model = load_fitted_model()
+
+    st.markdown(
+        """
+        <div class="hero">
+          <h1>Premier League match predictor</h1>
+          <p>Load an official matchweek or build a custom slate. The model is fitted on every
+          Premier League match in <code>epl_final.csv</code> (2000/01–2025/26), then adjusted for
+          this summer’s signings and coaching changes. It ranks the most likely 1X2 results and
+          flags the easiest, highest-confidence calls.</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    with st.sidebar:
+        render_sidebar(model)
+
+    tab_predict, tab_teams = st.tabs(["Predict matches", "Team strength"])
+    with tab_predict:
+        render_predict_tab(model)
+    with tab_teams:
+        render_team_board(model)
 
 
 if __name__ == "__main__":
