@@ -1,12 +1,14 @@
 """Live Premier League results: fetch, merge, and matchweek filtering.
 
-Completed 2026/27 scores are pulled from football-data.co.uk (same provider
-lineage as epl_final.csv) and merged into the training history.
+Completed 2026/27 scores are pulled preferentially from football-data.co.uk
+(same provider lineage as epl_final.csv). When that season file is not
+published yet, we fall back to the fixturedownload.com JSON feed.
 """
 
 from __future__ import annotations
 
 import io
+import json
 import re
 from pathlib import Path
 from urllib.error import HTTPError, URLError
@@ -19,7 +21,7 @@ from .fixtures import fixtures_for
 
 LIVE_SEASON = "2026/27"
 # football-data season folder is YY next-YY, e.g. 2627 for 2026/27.
-# Try https then http; the file appears once the season page lists Premier League.
+# The E0 file appears once their England page lists Premier League for the season.
 LIVE_SEASON_URLS = {
     "2026/27": [
         "https://www.football-data.co.uk/mmz4281/2627/E0.csv",
@@ -28,6 +30,24 @@ LIVE_SEASON_URLS = {
 }
 
 ENGLAND_INDEX_URL = "https://www.football-data.co.uk/englandm.php"
+FIXTUREDOWNLOAD_JSON = {
+    "2026/27": "https://fixturedownload.com/feed/json/epl-2026",
+}
+
+# fixturedownload short names -> epl_final / football-data CSV names
+_FD_NAME_ALIASES = {
+    "Man Utd": "Man United",
+    "Spurs": "Tottenham",
+    "Man City": "Man City",
+    "Nott'm Forest": "Nott'm Forest",
+    "Bournemouth": "Bournemouth",
+    "Brighton": "Brighton",
+    "Newcastle": "Newcastle",
+    "Hull": "Hull",
+    "Ipswich": "Ipswich",
+    "Coventry": "Coventry",
+    "Leeds": "Leeds",
+}
 
 # football-data.co.uk short names -> epl_final schema
 _FD_TO_INTERNAL = {
@@ -80,23 +100,43 @@ SCHEMA_COLS = [
 ]
 
 
+def _http_get(url: str, timeout: float = 20.0) -> bytes:
+    req = Request(
+        url,
+        headers={"User-Agent": "Mozilla/5.0 (compatible; epl-predictor/1.0)"},
+    )
+    with urlopen(req, timeout=timeout) as resp:
+        return resp.read()
+
+
 def _looks_like_results_csv(raw: bytes) -> bool:
     head = raw.lstrip(b"\xef\xbb\xbf")[:200].decode("utf-8", errors="ignore").lower()
     return "hometeam" in head and ("fthg" in head or "fulltimehomegoals" in head)
 
 
+def _canon_team(name: str) -> str:
+    name = str(name).strip()
+    return _FD_NAME_ALIASES.get(name, name)
+
+
+def _empty_status(season: str, url: str | None = None) -> dict:
+    return {
+        "ok": False,
+        "season": season,
+        "url": url,
+        "source": None,
+        "n_live": 0,
+        "message": "",
+        "soft": False,
+    }
+
+
 def _discover_e0_url(season_code: str = "2627") -> str | None:
     """Parse englandm.php for an E0.csv link matching the season folder."""
     try:
-        req = Request(
-            ENGLAND_INDEX_URL,
-            headers={"User-Agent": "Mozilla/5.0 (compatible; epl-predictor/1.0)"},
-        )
-        with urlopen(req, timeout=20.0) as resp:
-            html = resp.read().decode("utf-8", errors="ignore")
+        html = _http_get(ENGLAND_INDEX_URL).decode("utf-8", errors="ignore")
     except (HTTPError, URLError, TimeoutError, OSError):
         return None
-    # Prefer absolute or relative links containing mmz4281/{code}/E0.csv
     pattern = rf'https?://[^"\']*mmz4281/{season_code}/E0\.csv|mmz4281/{season_code}/E0\.csv'
     m = re.search(pattern, html, flags=re.I)
     if not m:
@@ -107,24 +147,14 @@ def _discover_e0_url(season_code: str = "2627") -> str | None:
     return "https://www.football-data.co.uk/" + href.lstrip("/")
 
 
-def fetch_season_results(
-    season: str = LIVE_SEASON,
-    timeout: float = 20.0,
-) -> tuple[pd.DataFrame, dict]:
-    """Download completed matches for a season. On failure returns empty + status."""
+def _fetch_football_data(season: str, timeout: float) -> tuple[pd.DataFrame, dict]:
     urls = list(LIVE_SEASON_URLS.get(season) or [])
-    status: dict = {
-        "ok": False,
-        "season": season,
-        "url": urls[0] if urls else None,
-        "n_live": 0,
-        "message": "",
-    }
+    status = _empty_status(season, urls[0] if urls else None)
     if not urls:
-        status["message"] = f"No live URL configured for season {season}."
+        status["message"] = f"No football-data URL configured for {season}."
+        status["soft"] = True
         return pd.DataFrame(columns=SCHEMA_COLS), status
 
-    # Season folder is first two digits of each year: 2026/27 -> 2627
     parts = season.split("/")
     if len(parts) == 2 and len(parts[0]) >= 2 and len(parts[1]) >= 2:
         code = parts[0][-2:] + parts[1][-2:]
@@ -136,34 +166,133 @@ def fetch_season_results(
     for url in urls:
         status["url"] = url
         try:
-            req = Request(
-                url,
-                headers={"User-Agent": "Mozilla/5.0 (compatible; epl-predictor/1.0)"},
-            )
-            with urlopen(req, timeout=timeout) as resp:
-                raw = resp.read()
+            raw = _http_get(url, timeout=timeout)
             if not raw or len(raw) < 40 or not _looks_like_results_csv(raw):
-                errors.append(f"{url}: not a results CSV")
+                errors.append(f"{url}: not a results CSV yet")
+                status["soft"] = True
                 continue
             df = pd.read_csv(io.BytesIO(raw))
             live = normalize_football_data(df, season=season)
             status["ok"] = True
+            status["source"] = "football-data.co.uk"
             status["n_live"] = int(len(live))
             status["message"] = (
                 f"Fetched {len(live)} completed {season} match(es) from football-data.co.uk."
                 if len(live)
-                else f"No completed {season} matches in the live file yet."
+                else f"football-data.co.uk has no completed {season} matches yet."
             )
             return live, status
-        except (HTTPError, URLError, TimeoutError, OSError, ValueError, pd.errors.ParserError) as exc:
+        except HTTPError as exc:
+            # 300/404 usually means the Premier League file is not published yet.
+            if exc.code in {300, 404}:
+                errors.append(f"{url}: HTTP {exc.code} (season file not published yet)")
+                status["soft"] = True
+            else:
+                errors.append(f"{url}: HTTPError: {exc}")
+        except (URLError, TimeoutError, OSError, ValueError, pd.errors.ParserError) as exc:
             errors.append(f"{url}: {type(exc).__name__}: {exc}")
 
-    status["message"] = (
-        "Could not fetch live results"
-        + (f" ({errors[0]})" if errors else "")
-        + ". Using historical CSV only."
-    )
+    status["message"] = errors[0] if errors else "football-data.co.uk unavailable."
     return pd.DataFrame(columns=SCHEMA_COLS), status
+
+
+def _fetch_fixturedownload(season: str, timeout: float) -> tuple[pd.DataFrame, dict]:
+    url = FIXTUREDOWNLOAD_JSON.get(season)
+    status = _empty_status(season, url)
+    if not url:
+        status["message"] = f"No fixturedownload feed for {season}."
+        status["soft"] = True
+        return pd.DataFrame(columns=SCHEMA_COLS), status
+
+    try:
+        raw = _http_get(url, timeout=timeout)
+        payload = json.loads(raw.decode("utf-8"))
+        if not isinstance(payload, list):
+            status["message"] = "fixturedownload feed was not a JSON list."
+            return pd.DataFrame(columns=SCHEMA_COLS), status
+        rows = []
+        for match in payload:
+            hg = match.get("HomeTeamScore")
+            ag = match.get("AwayTeamScore")
+            if hg is None or ag is None:
+                continue
+            home = _canon_team(match.get("HomeTeam", ""))
+            away = _canon_team(match.get("AwayTeam", ""))
+            if not home or not away:
+                continue
+            try:
+                hg_i, ag_i = int(hg), int(ag)
+            except (TypeError, ValueError):
+                continue
+            date = pd.to_datetime(match.get("DateUtc"), utc=True, errors="coerce")
+            if pd.isna(date):
+                continue
+            date = date.tz_convert(None).normalize()
+            rows.append(
+                {
+                    "Season": season,
+                    "MatchDate": date,
+                    "HomeTeam": home,
+                    "AwayTeam": away,
+                    "FullTimeHomeGoals": hg_i,
+                    "FullTimeAwayGoals": ag_i,
+                    "FullTimeResult": "H" if hg_i > ag_i else "A" if hg_i < ag_i else "D",
+                }
+            )
+        live = pd.DataFrame(rows)
+        if live.empty:
+            live = pd.DataFrame(columns=SCHEMA_COLS)
+        else:
+            for col in SCHEMA_COLS:
+                if col not in live.columns:
+                    live[col] = pd.NA
+            live = live[SCHEMA_COLS].reset_index(drop=True)
+        status["ok"] = True
+        status["source"] = "fixturedownload.com"
+        status["n_live"] = int(len(live))
+        status["message"] = (
+            f"Fetched {len(live)} completed {season} match(es) from fixturedownload.com"
+            " (football-data.co.uk Premier League file not published yet)."
+            if len(live)
+            else f"No completed {season} scores in the fixturedownload feed yet."
+        )
+        return live, status
+    except (HTTPError, URLError, TimeoutError, OSError, ValueError, json.JSONDecodeError) as exc:
+        status["message"] = f"fixturedownload.com: {type(exc).__name__}: {exc}"
+        return pd.DataFrame(columns=SCHEMA_COLS), status
+
+
+def fetch_season_results(
+    season: str = LIVE_SEASON,
+    timeout: float = 20.0,
+) -> tuple[pd.DataFrame, dict]:
+    """Download completed matches for a season. On failure returns empty + status.
+
+    Prefers football-data.co.uk; falls back to fixturedownload.com JSON when the
+    Premier League E0 file is not published yet (common early in the season).
+    """
+    live, status = _fetch_football_data(season, timeout=timeout)
+    if status.get("ok") and status.get("n_live", 0) > 0:
+        return live, status
+
+    alt, alt_status = _fetch_fixturedownload(season, timeout=timeout)
+    if alt_status.get("ok"):
+        return alt, alt_status
+
+    combined = _empty_status(season, status.get("url"))
+    if status.get("soft") and not alt_status.get("ok"):
+        combined["soft"] = True
+        combined["message"] = (
+            f"Live {season} results are not published on football-data.co.uk yet "
+            "(Premier League CSV still missing). Using historical CSV only until scores appear."
+        )
+    else:
+        combined["message"] = (
+            status.get("message")
+            or alt_status.get("message")
+            or "Could not fetch live results. Using historical CSV only."
+        )
+    return pd.DataFrame(columns=SCHEMA_COLS), combined
 
 
 def normalize_football_data(df: pd.DataFrame, season: str = LIVE_SEASON) -> pd.DataFrame:
@@ -184,8 +313,8 @@ def normalize_football_data(df: pd.DataFrame, season: str = LIVE_SEASON) -> pd.D
     for col in ("FullTimeHomeGoals", "FullTimeAwayGoals"):
         out[col] = pd.to_numeric(out[col], errors="coerce")
     out = out.dropna(subset=["FullTimeHomeGoals", "FullTimeAwayGoals"])
-    out["HomeTeam"] = out["HomeTeam"].astype(str).str.strip()
-    out["AwayTeam"] = out["AwayTeam"].astype(str).str.strip()
+    out["HomeTeam"] = out["HomeTeam"].map(_canon_team)
+    out["AwayTeam"] = out["AwayTeam"].map(_canon_team)
     return out[SCHEMA_COLS].reset_index(drop=True)
 
 

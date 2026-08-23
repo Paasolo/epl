@@ -373,8 +373,13 @@ def render_sidebar(model) -> None:
         + (f" · {n_live} from {LIVE_SEASON}" if n_live else "")
     )
     if live_status and not live_status.get("ok", True) and live_status.get("message"):
-        st.warning(live_status["message"])
-    elif live_status.get("message") and n_live == 0 and live_status.get("ok"):
+        if live_status.get("soft"):
+            st.info(live_status["message"])
+        else:
+            st.warning(live_status["message"])
+    elif live_status.get("ok") and live_status.get("message"):
+        st.caption(live_status["message"])
+    elif live_status.get("message") and n_live == 0:
         st.caption(live_status["message"])
     if st.button("Refresh results", use_container_width=True, help="Re-fetch football-data.co.uk and refit"):
         refresh_training_data()

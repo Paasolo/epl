@@ -19,7 +19,7 @@ The app opens in your browser with three tabs:
 - **Team strength** — Elo, attack/defence, recent form, manager, and promotion status for all 20 clubs.
 - **Backtest explorer** — walk-forward 2025/26 accuracy by confidence band, month, and biggest misses.
 
-Use **Refresh results** in the sidebar to re-fetch football-data.co.uk and refit. If the network fetch fails, the app falls back to `epl_final.csv` only.
+Use **Refresh results** in the sidebar to re-fetch the latest scores and refit. Primary source is football-data.co.uk; if that season’s Premier League CSV is not published yet, the app falls back to fixturedownload.com. If both fail, it uses `epl_final.csv` only.
 
 ## What the model uses
 
