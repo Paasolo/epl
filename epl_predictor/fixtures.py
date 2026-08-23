@@ -594,6 +594,17 @@ def fixtures_for(gw: int) -> list[tuple[str, str]]:
     return list(MATCHWEEKS[gw]["fixtures"])
 
 
+def fixtures_for_unplayed(
+    gw: int,
+    matches,
+    season: str = "2026/27",
+) -> tuple[list[tuple[str, str]], list[dict]]:
+    """Official GW fixtures with completed games removed (see results.split_matchweek_fixtures)."""
+    from epl_predictor.results import split_matchweek_fixtures
+
+    return split_matchweek_fixtures(gw, matches, season=season)
+
+
 def validate_matchweeks() -> list[str]:
     """Return human-readable problems, or [] if all weeks look valid."""
     expected = set(PREMIER_LEAGUE_2026_27)

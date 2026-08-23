@@ -10,8 +10,16 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from epl_predictor.context import PREMIER_LEAGUE_2026_27, PROMOTED_TEAMS, TEAM_CONTEXT
-from epl_predictor.engine import MODEL_API_VERSION, build_backtest_rows, clear_model_cache, get_model, ranked_picks
-from epl_predictor.fixtures import fixtures_for, matchweek_options, validate_matchweeks
+from epl_predictor.engine import (
+    MODEL_API_VERSION,
+    build_backtest_rows,
+    clear_model_cache,
+    current_results_fingerprint,
+    get_model,
+    ranked_picks,
+)
+from epl_predictor.fixtures import fixtures_for_unplayed, matchweek_options, validate_matchweeks
+from epl_predictor.results import LIVE_SEASON
 
 st.set_page_config(
     page_title="EPL Match Predictor 2026/27",
@@ -113,11 +121,23 @@ st.markdown(
 )
 
 
+@st.cache_data(ttl=1800, show_spinner=False)
+def cached_results_fingerprint() -> str:
+    return current_results_fingerprint(include_live=True)
+
+
 @st.cache_resource(show_spinner="Loading calibrated Premier League ratings…")
-def load_fitted_model(api_version: int = MODEL_API_VERSION):
-    # api_version is part of the cache key so Cloud rebuilds after model API bumps.
-    _ = api_version
-    return get_model()
+def load_fitted_model(api_version: int = MODEL_API_VERSION, fingerprint: str = ""):
+    # api_version + fingerprint are cache keys so Cloud rebuilds after API bumps
+    # or when new live scores appear.
+    return get_model(fingerprint or cached_results_fingerprint())
+
+
+def refresh_training_data() -> None:
+    """Drop disk/process caches and force a live re-fetch on next load."""
+    clear_model_cache()
+    cached_results_fingerprint.clear()
+    load_fitted_model.clear()
 
 
 def team_label(name: str) -> str:
@@ -170,13 +190,13 @@ def clear_match_widget_keys(match_ids: list[int]) -> None:
             st.session_state.pop(f"{prefix}{mid}", None)
 
 
-def load_matchweek_into_state(gw: int) -> None:
-    pairs = fixtures_for(gw)
+def load_matchweek_into_state(gw: int, model) -> None:
+    remaining, excluded = fixtures_for_unplayed(gw, model.matches, season=LIVE_SEASON)
     clear_match_widget_keys(list(st.session_state.get("match_ids", [])))
-    new_ids = list(range(len(pairs)))
+    new_ids = list(range(len(remaining)))
     st.session_state.match_ids = new_ids
     st.session_state.next_match_id = max(new_ids) + 1 if new_ids else 0
-    for mid, (home, away) in enumerate(pairs):
+    for mid, (home, away) in enumerate(remaining):
         st.session_state[f"club_{mid}"] = home
         st.session_state[f"venue_{mid}"] = "Home"
         st.session_state[f"opp_{mid}"] = away
@@ -184,6 +204,12 @@ def load_matchweek_into_state(gw: int) -> None:
     st.session_state.pop("last_ranked_table", None)
     st.session_state.pop("last_ranked", None)
     st.session_state.pop("last_apply_context", None)
+    st.session_state["mw_excluded"] = excluded
+    st.session_state["mw_loaded"] = gw
+    if not remaining and excluded:
+        st.session_state["mw_complete"] = True
+    else:
+        st.session_state.pop("mw_complete", None)
 
 
 def ranked_table_rows(ranked: list[dict]) -> list[dict]:
@@ -336,10 +362,28 @@ def render_prediction(pred: dict, easiest: bool) -> None:
 def render_sidebar(model) -> None:
     bt = model.backtest_summary()
     st.header("Model card")
+    meta = getattr(model, "training_meta", {}) or {}
+    through = meta.get("through")
+    through_txt = through.strftime("%d %b %Y") if through is not None else "—"
+    n_matches = meta.get("n_matches", len(getattr(model, "matches", [])))
+    n_live = meta.get("n_live_season", 0)
+    live_status = meta.get("live_status") or {}
+    st.caption(
+        f"Training through **{through_txt}** · {n_matches:,} matches"
+        + (f" · {n_live} from {LIVE_SEASON}" if n_live else "")
+    )
+    if live_status and not live_status.get("ok", True) and live_status.get("message"):
+        st.warning(live_status["message"])
+    elif live_status.get("message") and n_live == 0 and live_status.get("ok"):
+        st.caption(live_status["message"])
+    if st.button("Refresh results", use_container_width=True, help="Re-fetch football-data.co.uk and refit"):
+        refresh_training_data()
+        st.rerun()
     st.write(
         "Walk-forward ensemble: shots-based xG ratings, Dixon–Coles Poisson, "
         "Elo 1X2, season mean-reversion, and temperature calibration on the last "
-        "three Premier League seasons. Summer 2026 signings and coaching changes "
+        "three Premier League seasons. Completed 2026/27 scores are merged from "
+        "football-data.co.uk. Summer 2026 signings and coaching changes "
         "are a capped overlay. Promoted clubs are shrunk toward a Championship prior."
     )
     st.metric(
@@ -365,7 +409,8 @@ def render_team_board(model) -> None:
     st.subheader("Team strength board")
     st.caption(
         "Ratings after walking through every Premier League match in the dataset "
-        "(2000/01–2025/26), before summer 2026 context is applied to individual fixtures."
+        "(historical CSV plus any completed 2026/27 results), before summer 2026 "
+        "context is applied to individual fixtures."
     )
 
     rows = []
@@ -425,9 +470,11 @@ def render_backtest_tab(model) -> None:
         rows = build_backtest_rows(model, "2025/26")
     except Exception as exc:  # noqa: BLE001 — show a clean recovery path in the UI
         st.error(f"Could not build backtest rows ({type(exc).__name__}). Rebuilding model cache…")
-        clear_model_cache()
-        load_fitted_model.clear()
-        model = load_fitted_model()
+        refresh_training_data()
+        model = load_fitted_model(
+            api_version=MODEL_API_VERSION,
+            fingerprint=cached_results_fingerprint(),
+        )
         rows = build_backtest_rows(model, "2025/26")
     if not rows:
         st.warning(
@@ -435,8 +482,7 @@ def render_backtest_tab(model) -> None:
             "(needed once after upgrading the app)."
         )
         if st.button("Rebuild model cache", type="primary"):
-            clear_model_cache()
-            load_fitted_model.clear()
+            refresh_training_data()
             st.rerun()
         return
 
@@ -552,6 +598,7 @@ def render_predict_tab(model) -> None:
     st.subheader("Select matches")
     st.caption(
         "Load an official matchweek, or build a custom slate. "
+        "Finished games are dropped automatically when you load a matchweek. "
         "Choose a club, home or away, then the opponent."
     )
 
@@ -569,7 +616,7 @@ def render_predict_tab(model) -> None:
     with load_c2:
         st.markdown("<div style='height: 1.7rem'></div>", unsafe_allow_html=True)
         if st.button("Load matchweek", use_container_width=True, type="secondary"):
-            load_matchweek_into_state(gw_labels[gw_label])
+            load_matchweek_into_state(gw_labels[gw_label], model)
             st.rerun()
     with load_c3:
         st.markdown("<div style='height: 1.7rem'></div>", unsafe_allow_html=True)
@@ -582,8 +629,22 @@ def render_predict_tab(model) -> None:
             st.session_state.next_match_id += 1
             st.rerun()
 
+    excluded = st.session_state.get("mw_excluded") or []
+    if st.session_state.get("mw_complete"):
+        st.success(
+            "This matchweek is fully played — nothing left to predict. "
+            + "; ".join(row["label"] for row in excluded[:10])
+        )
+    elif excluded:
+        st.info(
+            f"Excluded {len(excluded)} finished match(es): "
+            + "; ".join(row["label"] for row in excluded)
+        )
+
     fixtures: list[tuple[int, str, str]] = []
     ids = list(st.session_state.match_ids)
+    if not ids:
+        st.caption("No fixtures on the slate. Load a matchweek with remaining games, or add a match.")
     for idx, match_id in enumerate(ids):
         club_default, venue_default, opp_default = DEFAULT_FIXTURES[match_id % len(DEFAULT_FIXTURES)]
         st.markdown(f"**Match {idx + 1}**")
@@ -648,9 +709,17 @@ def render_predict_tab(model) -> None:
         )
 
     n = len(fixtures)
-    run = st.button(f"Predict {n} match{'es' if n != 1 else ''}", type="primary", use_container_width=True)
+    run = st.button(
+        f"Predict {n} match{'es' if n != 1 else ''}",
+        type="primary",
+        use_container_width=True,
+        disabled=n == 0,
+    )
 
     if run:
+        if not fixtures:
+            st.error("Add at least one match to predict.")
+            return
         if any(home == away for _, home, away in fixtures):
             st.error("A team cannot play itself.")
             return
@@ -764,7 +833,8 @@ def render_predict_tab(model) -> None:
 
 
 def main() -> None:
-    model = load_fitted_model()
+    fingerprint = cached_results_fingerprint()
+    model = load_fitted_model(api_version=MODEL_API_VERSION, fingerprint=fingerprint)
     mw_problems = validate_matchweeks()
     if mw_problems:
         st.warning("Fixture slate issue: " + "; ".join(mw_problems[:3]))
@@ -773,10 +843,10 @@ def main() -> None:
         """
         <div class="hero">
           <h1>Premier League match predictor</h1>
-          <p>Load an official matchweek or build a custom slate. The model is fitted on every
-          Premier League match in <code>epl_final.csv</code> (2000/01–2025/26), then adjusted for
-          this summer’s signings and coaching changes. Compare history-only vs overlay leanings,
-          inspect team strength, and review the 2025/26 walk-forward backtest.</p>
+          <p>Load an official matchweek or build a custom slate. The model is fitted on
+          Premier League history in <code>epl_final.csv</code> plus completed 2026/27 scores
+          from football-data.co.uk, then adjusted for this summer’s signings and coaching.
+          Finished fixtures are skipped when you load a matchweek.</p>
         </div>
         """,
         unsafe_allow_html=True,
