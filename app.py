@@ -63,6 +63,98 @@ st.markdown(
         padding: 1.1rem 1.2rem 1.2rem;
         height: 100%;
       }}
+      .prediction-card {{
+        background: linear-gradient(180deg, #152036 0%, {CARD} 100%);
+        border: 1px solid {LINE};
+        border-radius: 18px;
+        padding: 1.25rem 1.35rem 1.3rem;
+        margin: 0 0 1.15rem 0;
+        box-shadow: 0 10px 28px rgba(0, 0, 0, 0.28);
+      }}
+      .prediction-card.hot {{
+        border-color: #3A6B58;
+        box-shadow: 0 10px 28px rgba(16, 38, 31, 0.45);
+      }}
+      .prediction-card .match-title {{
+        font-size: 1.28rem;
+        font-weight: 800;
+        margin: 0 0 0.25rem 0;
+        letter-spacing: -0.02em;
+      }}
+      .prediction-card .sub {{
+        color: {MUTED};
+        font-size: 0.9rem;
+        margin-bottom: 0.75rem;
+      }}
+      .pick-block {{
+        background: #0E1626;
+        border: 1px solid {LINE};
+        border-radius: 14px;
+        padding: 0.85rem 1rem;
+        margin: 0.65rem 0 0.9rem;
+      }}
+      .pick-block .pick {{
+        font-size: 1.55rem;
+        font-weight: 800;
+        color: {GOLD};
+        margin: 0 0 0.2rem 0;
+        line-height: 1.2;
+      }}
+      .pick-block .pick-meta {{
+        color: {TEXT};
+        font-size: 0.98rem;
+      }}
+      .prob-row {{
+        display: flex;
+        align-items: center;
+        gap: 0.65rem;
+        margin: 0.35rem 0;
+        font-size: 0.88rem;
+      }}
+      .prob-row .label {{
+        width: 4.8rem;
+        color: {MUTED};
+        flex-shrink: 0;
+      }}
+      .prob-row .track {{
+        flex: 1;
+        height: 0.55rem;
+        background: #0E1626;
+        border: 1px solid {LINE};
+        border-radius: 999px;
+        overflow: hidden;
+      }}
+      .prob-row .fill {{
+        height: 100%;
+        border-radius: 999px;
+      }}
+      .prob-row .fill.home {{ background: {HOME_C}; }}
+      .prob-row .fill.draw {{ background: {DRAW_C}; }}
+      .prob-row .fill.away {{ background: {AWAY_C}; }}
+      .prob-row .pct {{
+        width: 3.2rem;
+        text-align: right;
+        font-weight: 700;
+        color: {TEXT};
+      }}
+      .score-grid {{
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.4rem;
+        margin-top: 0.75rem;
+      }}
+      .score-pill {{
+        background: #0E1626;
+        border: 1px solid {LINE};
+        border-radius: 10px;
+        padding: 0.35rem 0.55rem;
+        font-size: 0.82rem;
+        color: {MUTED};
+      }}
+      .score-pill strong {{
+        color: {TEXT};
+        margin-right: 0.35rem;
+      }}
       .match-title {{ font-size: 1.15rem; font-weight: 700; margin-bottom: 0.15rem; }}
       .sub {{ color: {MUTED}; font-size: 0.9rem; margin-bottom: 0.85rem; }}
       .pick {{
@@ -155,6 +247,7 @@ def reset_slate_state() -> None:
         "mw_excluded",
         "mw_loaded",
         "mw_complete",
+        "mw_locked",
     ):
         st.session_state.pop(key, None)
 
@@ -237,10 +330,19 @@ def load_matchweek_into_state(gw: int, model, league) -> None:
     st.session_state.pop("last_apply_context", None)
     st.session_state["mw_excluded"] = excluded
     st.session_state["mw_loaded"] = gw
+    st.session_state["mw_locked"] = True
     if not remaining and excluded:
         st.session_state["mw_complete"] = True
     else:
         st.session_state.pop("mw_complete", None)
+
+
+def unlock_matchweek_slate() -> None:
+    """Allow editing the current fixtures as a custom slate."""
+    st.session_state.pop("mw_locked", None)
+    st.session_state.pop("mw_loaded", None)
+    st.session_state.pop("mw_excluded", None)
+    st.session_state.pop("mw_complete", None)
 
 
 def ranked_table_rows(ranked: list[dict]) -> list[dict]:
@@ -285,10 +387,12 @@ def export_bytes(rows: list[dict]) -> tuple[str, str]:
     return csv_buf.getvalue(), json_text
 
 
-def render_prediction(pred: dict, easiest: bool, league) -> None:
+def render_prediction(pred: dict, easiest: bool, league, rank: int | None = None) -> None:
     ctx_h = pred["home_context"]
     ctx_a = pred["away_context"]
     chips = []
+    if rank is not None:
+        chips.append(f"Rank #{rank}")
     if pred["home_display"] in league.promoted:
         chips.append("Home promoted")
     if pred["away_display"] in league.promoted:
@@ -317,43 +421,76 @@ def render_prediction(pred: dict, easiest: bool, league) -> None:
         "D": "Draw",
         "A": pred["away_display"],
     }[pred["best_code"]]
+    top_score = pred["top_scores"][0]["score"] if pred.get("top_scores") else "—"
+    score_pills = "".join(
+        f'<span class="score-pill"><strong>{item["score"]}</strong>{item["prob"]*100:.1f}%</span>'
+        for item in pred.get("top_scores", [])[:4]
+    )
+    extras = pred.get("extras") or []
+    extra_pills = "".join(
+        f'<span class="score-pill"><strong>{extra["market"]}:</strong>{extra["pick"]} · {extra["prob"]*100:.0f}%</span>'
+        for extra in extras[:3]
+    )
+    card_class = "prediction-card hot" if easiest else "prediction-card"
+    conf = pred["confidence"]
 
     st.markdown(
         f"""
-        <div class="result-card">
+        <div class="{card_class}">
           <div class="match-title">{pred['home_display']} vs {pred['away_display']}</div>
-          <div class="sub">Expected score {pred['lambda_home']:.2f} – {pred['lambda_away']:.2f}
+          <div class="sub">Expected xG {pred['lambda_home']:.2f} – {pred['lambda_away']:.2f}
             · Elo {pred['elo_home']:.0f} vs {pred['elo_away']:.0f}
-            · Last season {pred['home_position']} vs {pred['away_position']}</div>
+            · Last season {pred['home_position']} vs {pred['away_position']}
+            · Most likely score <b style="color:{TEXT}">{top_score}</b></div>
           {chip_html}
-          <div class="pick">{pred['best_label']} &nbsp;·&nbsp; {pick_team}</div>
-          <div>Probability <b>{pred['best_prob']*100:.1f}%</b>
-            &nbsp;·&nbsp; Confidence
-            <span class="conf-{pred['confidence']}">{pred['confidence']}</span>
-            &nbsp;·&nbsp; Edge over next outcome {pred['gap']*100:.1f}pp</div>
+          <div class="pick-block">
+            <div class="pick">{pred['best_label']} · {pick_team}</div>
+            <div class="pick-meta">
+              Probability <b>{pred['best_prob']*100:.1f}%</b>
+              &nbsp;·&nbsp; Confidence
+              <span class="conf-{conf}">{conf}</span>
+              &nbsp;·&nbsp; Edge {pred['gap']*100:.1f}pp
+            </div>
+          </div>
+          <div class="prob-row">
+            <div class="label">Home</div>
+            <div class="track"><div class="fill home" style="width:{pred['p_home']*100:.1f}%"></div></div>
+            <div class="pct">{pred['p_home']*100:.1f}%</div>
+          </div>
+          <div class="prob-row">
+            <div class="label">Draw</div>
+            <div class="track"><div class="fill draw" style="width:{pred['p_draw']*100:.1f}%"></div></div>
+            <div class="pct">{pred['p_draw']*100:.1f}%</div>
+          </div>
+          <div class="prob-row">
+            <div class="label">Away</div>
+            <div class="track"><div class="fill away" style="width:{pred['p_away']*100:.1f}%"></div></div>
+            <div class="pct">{pred['p_away']*100:.1f}%</div>
+          </div>
+          <div class="score-grid">{score_pills}{extra_pills}</div>
         </div>
         """,
         unsafe_allow_html=True,
     )
-    st.plotly_chart(
-        outcome_chart(pred),
-        use_container_width=True,
-        key=f"chart-{league.id}-{pred['home_display']}-{pred['away_display']}-{pred.get('slot_id', 0)}",
-    )
 
-    extras = pred["extras"]
-    st.markdown("**Most likely supporting outcomes**")
-    cols = st.columns(2)
-    for i, extra in enumerate(extras[:4]):
-        with cols[i % 2]:
-            st.metric(extra["market"], extra["pick"], f"{extra['prob']*100:.1f}% model probability")
+    with st.expander("Chart, markets & why this lean", expanded=False):
+        st.plotly_chart(
+            outcome_chart(pred),
+            use_container_width=True,
+            key=f"chart-{league.id}-{pred['home_display']}-{pred['away_display']}-{pred.get('slot_id', 0)}",
+        )
+        extras = pred["extras"]
+        st.markdown("**Most likely supporting outcomes**")
+        cols = st.columns(2)
+        for i, extra in enumerate(extras[:4]):
+            with cols[i % 2]:
+                st.metric(extra["market"], extra["pick"], f"{extra['prob']*100:.1f}% model probability")
 
-    st.markdown("**Most likely scorelines**")
-    score_cols = st.columns(len(pred["top_scores"]))
-    for col, item in zip(score_cols, pred["top_scores"]):
-        col.metric(item["score"], f"{item['prob']*100:.1f}%")
+        st.markdown("**Most likely scorelines**")
+        score_cols = st.columns(len(pred["top_scores"]))
+        for col, item in zip(score_cols, pred["top_scores"]):
+            col.metric(item["score"], f"{item['prob']*100:.1f}%")
 
-    with st.expander("Why this lean — signings, coaching, form"):
         left, right = st.columns(2)
         with left:
             st.markdown(f"**{pred['home_display']}** (home)")
@@ -633,17 +770,25 @@ def render_predict_tab(model, league) -> None:
     teams = league.clubs
     labels = {t: team_label(t, league) for t in teams}
     defaults = default_fixtures(league)
+    mw_locked = bool(st.session_state.get("mw_locked"))
 
     if "match_ids" not in st.session_state:
         st.session_state.match_ids = [0, 1]
         st.session_state.next_match_id = 2
 
     st.subheader("Select matches")
-    st.caption(
-        "Load an official matchweek, or build a custom slate. "
-        "Finished games are dropped automatically when you load a matchweek. "
-        "Choose a club, home or away, then the opponent."
-    )
+    if mw_locked:
+        gw = st.session_state.get("mw_loaded")
+        st.caption(
+            f"Official matchweek {gw} is loaded and locked. "
+            "Selections cannot be changed until you unlock to a custom slate."
+        )
+    else:
+        st.caption(
+            "Load an official matchweek, or build a custom slate. "
+            "Finished games are dropped automatically when you load a matchweek. "
+            "Choose a club, home or away, then the opponent."
+        )
 
     apply_context = st.toggle(
         "Apply summer signings & coaching overlay",
@@ -677,14 +822,19 @@ def render_predict_tab(model, league) -> None:
             st.rerun()
     with load_c3:
         st.markdown("<div style='height: 1.7rem'></div>", unsafe_allow_html=True)
-        if st.button(
-            "Add match",
-            disabled=len(st.session_state.match_ids) >= MAX_MATCHES,
-            use_container_width=True,
-        ):
-            st.session_state.match_ids.append(st.session_state.next_match_id)
-            st.session_state.next_match_id += 1
-            st.rerun()
+        if mw_locked:
+            if st.button("Unlock custom slate", use_container_width=True):
+                unlock_matchweek_slate()
+                st.rerun()
+        else:
+            if st.button(
+                "Add match",
+                disabled=len(st.session_state.match_ids) >= MAX_MATCHES,
+                use_container_width=True,
+            ):
+                st.session_state.match_ids.append(st.session_state.next_match_id)
+                st.session_state.next_match_id += 1
+                st.rerun()
 
     excluded = st.session_state.get("mw_excluded") or []
     if st.session_state.get("mw_complete"):
@@ -715,6 +865,7 @@ def render_predict_tab(model, league) -> None:
                 teams,
                 format_func=lambda t: labels[t],
                 key=club_key,
+                disabled=mw_locked,
             )
         with c2:
             venue_key = f"venue_{match_id}"
@@ -725,6 +876,7 @@ def render_predict_tab(model, league) -> None:
                 ["Home", "Away"],
                 horizontal=True,
                 key=venue_key,
+                disabled=mw_locked,
             )
         with c3:
             opps = [t for t in teams if t != club]
@@ -736,10 +888,16 @@ def render_predict_tab(model, league) -> None:
                 opps,
                 format_func=lambda t: labels[t],
                 key=opp_key,
+                disabled=mw_locked,
             )
         with c4:
             st.markdown("<div style='height: 1.7rem'></div>", unsafe_allow_html=True)
-            if st.button("Remove", disabled=len(ids) <= 1, key=f"remove_{match_id}", use_container_width=True):
+            if st.button(
+                "Remove",
+                disabled=mw_locked or len(ids) <= 1,
+                key=f"remove_{match_id}",
+                use_container_width=True,
+            ):
                 clear_match_widget_keys([match_id])
                 st.session_state.match_ids = [mid for mid in st.session_state.match_ids if mid != match_id]
                 st.session_state.pop("last_predictions", None)
@@ -885,12 +1043,17 @@ def render_predict_tab(model, league) -> None:
             key=f"dl_json_{league.id}",
         )
 
-    for start in range(0, len(preds), 2):
-        cols = st.columns(2)
-        chunk = preds[start : start + 2]
-        for col, pred in zip(cols, chunk):
-            with col:
-                render_prediction(pred, pred["is_easiest"], league)
+    st.markdown("**Match prediction cards**")
+    st.caption("Each card shows the headline pick, confidence, and 1X2 probabilities. Open a card’s expander for charts and context.")
+    # Show in ranked order so the strongest calls appear first.
+    rank_by_id = {id(p): i for i, p in enumerate(ranked, start=1)}
+    for pred in ranked:
+        render_prediction(
+            pred,
+            pred["is_easiest"],
+            league,
+            rank=rank_by_id.get(id(pred)),
+        )
 
 
 def main() -> None:
