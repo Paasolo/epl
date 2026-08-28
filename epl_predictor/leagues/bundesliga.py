@@ -1,0 +1,106 @@
+"""Bundesliga 2026/27 configuration."""
+
+from epl_predictor.leagues.base import LeagueConfig, make_context
+
+CSV_NAME = {
+    'FC Augsburg': 'Augsburg',
+    'Bayern Munich': 'Bayern Munich',
+    'Borussia Dortmund': 'Dortmund',
+    'Eintracht Frankfurt': 'Ein Frankfurt',
+    '1. FC Köln': 'FC Koln',
+    'SC Freiburg': 'Freiburg',
+    'Hamburger SV': 'Hamburg',
+    'TSG Hoffenheim': 'Hoffenheim',
+    'Bayer Leverkusen': 'Leverkusen',
+    'Borussia Mönchengladbach': "M'gladbach",
+    'Mainz 05': 'Mainz',
+    'RB Leipzig': 'RB Leipzig',
+    'VfB Stuttgart': 'Stuttgart',
+    'Union Berlin': 'Union Berlin',
+    'Werder Bremen': 'Werder Bremen',
+    'Schalke 04': 'Schalke 04',
+    'SV Elversberg': 'Elversberg',
+    'SC Paderborn': 'Paderborn',
+}
+
+LAST_SEASON_POSITION = {
+    'Bayern Munich': 1,
+    'Borussia Dortmund': 2,
+    'RB Leipzig': 3,
+    'VfB Stuttgart': 4,
+    'TSG Hoffenheim': 5,
+    'Bayer Leverkusen': 6,
+    'SC Freiburg': 7,
+    'Eintracht Frankfurt': 8,
+    'FC Augsburg': 9,
+    'Mainz 05': 10,
+    'Union Berlin': 11,
+    'Borussia Mönchengladbach': 12,
+    'Hamburger SV': 13,
+    '1. FC Köln': 14,
+    'Werder Bremen': 15,
+    'Schalke 04': 21,
+    'SV Elversberg': 22,
+    'SC Paderborn': 23,
+}
+
+PROMOTED = frozenset(['SC Paderborn', 'SV Elversberg', 'Schalke 04'])
+
+TEAM_CONTEXT = {
+    'FC Augsburg': make_context('Manuel Baum', net_spend_m=13, squad_turnover=0.22, key_ins=['centre-back', 'pressing forward'], key_outs=['starting midfielder'], notes='Physical depth and continuity provide a solid mid-table base.'),
+    'Bayern Munich': make_context('Vincent Kompany', pedigree='elite', net_spend_m=78, squad_turnover=0.17, key_ins=['elite winger', 'central defender'], key_outs=['senior midfielder'], notes='The champions remain the league benchmark in every unit.'),
+    'Borussia Dortmund': make_context('Niko Kovač', net_spend_m=52, squad_turnover=0.2, key_ins=['starting forward', 'full-back'], key_outs=['attacking midfielder'], notes='High-end attacking depth makes Dortmund the leading challenger.'),
+    'Eintracht Frankfurt': make_context('Adi Hütter', previous_manager='Dino Toppmöller', change_type='summer', pedigree='elite', net_spend_m=38, squad_turnover=0.25, key_ins=['mobile striker', 'centre-back'], key_outs=['leading scorer'], notes='An experienced return should ease a significant attacking transition.'),
+    '1. FC Köln': make_context('René Wagner', net_spend_m=14, squad_turnover=0.23, key_ins=['creative midfielder'], key_outs=['first-choice defender'], notes='Energy and home support offset a relatively thin squad.'),
+    'SC Freiburg': make_context('Julian Schuster', net_spend_m=21, squad_turnover=0.16, key_ins=['wide forward'], key_outs=['rotation striker'], notes='Exceptional continuity supports another push for Europe.'),
+    'Hamburger SV': make_context('Merlin Polzin', net_spend_m=19, squad_turnover=0.22, key_ins=['holding midfielder', 'centre-back'], key_outs=['veteran winger'], notes='Second-season recruitment focuses on reducing defensive volatility.'),
+    'TSG Hoffenheim': make_context('Christian Ilzer', net_spend_m=27, squad_turnover=0.21, key_ins=['striker', 'wing-back'], key_outs=['central defender'], notes='A coherent pressing game and added pace sustain European ambitions.'),
+    'Bayer Leverkusen': make_context('Carles Martínez Novell', previous_manager='Kasper Hjulmand', change_type='summer', net_spend_m=48, squad_turnover=0.27, key_ins=['creative midfielder', 'centre-forward'], key_outs=['star winger', 'senior defender'], notes='Strong recruitment must absorb another managerial and personnel reset.'),
+    'Borussia Mönchengladbach': make_context('Eugen Polanski', net_spend_m=16, squad_turnover=0.24, key_ins=['centre-back', 'winger'], key_outs=['starting forward'], notes='Defensive improvement is needed to escape the lower mid-table.'),
+    'Mainz 05': make_context('Urs Fischer', net_spend_m=15, squad_turnover=0.2, key_ins=['target forward'], key_outs=['box-to-box midfielder'], notes='A disciplined structure should keep Mainz comfortably competitive.'),
+    'RB Leipzig': make_context('Martín Demichelis', previous_manager='Ole Werner', change_type='summer', net_spend_m=60, squad_turnover=0.26, key_ins=['elite forward', 'ball-playing defender'], key_outs=['leading attacker'], notes='Youth, pace and deep resources preserve Champions League expectations.'),
+    'VfB Stuttgart': make_context('Sebastian Hoeneß', net_spend_m=40, squad_turnover=0.19, key_ins=['striker', 'central midfielder'], key_outs=['starting defender'], notes='Tactical continuity supports another top-four challenge.'),
+    'Union Berlin': make_context('Mauro Lustrinelli', previous_manager='Steffen Baumgart', change_type='summer', net_spend_m=17, squad_turnover=0.25, key_ins=['centre-forward', 'wing-back'], key_outs=['veteran centre-back'], notes='A new coach inherits a resilient squad built for tight matches.'),
+    'Werder Bremen': make_context('Daniel Thioune', previous_manager='Horst Steffen', change_type='summer', net_spend_m=14, squad_turnover=0.27, key_ins=['goalkeeper', 'wide attacker'], key_outs=['leading midfielder'], notes='Managerial change and moderate churn create early-season uncertainty.'),
+    'Schalke 04': make_context('Miron Muslić', change_type='summer', pedigree='unproven', promoted=True, net_spend_m=32, squad_turnover=0.31, key_ins=['Bundesliga striker', 'centre-back'], key_outs=['promotion midfielder'], notes="Large support and investment improve a promoted side's survival case."),
+    'SV Elversberg': make_context('Vincent Wagner', change_type='summer', pedigree='unproven', promoted=True, net_spend_m=18, squad_turnover=0.34, key_ins=['top-flight goalkeeper', 'holding midfielder'], key_outs=['loan striker'], notes='The smallest promoted squad faces a substantial quality jump.'),
+    'SC Paderborn': make_context('Ralf Kettemann', change_type='summer', pedigree='unproven', promoted=True, net_spend_m=21, squad_turnover=0.3, key_ins=['centre-back', 'quick winger'], key_outs=['first-choice full-back'], notes='A clear tactical identity offers hope despite limited depth.'),
+}
+
+NAME_ALIASES = {
+    'FC Bayern München': 'Bayern Munich',
+    'Bayern': 'Bayern Munich',
+    'Borussia Dortmund': 'Dortmund',
+    'Eintracht Frankfurt': 'Ein Frankfurt',
+    '1. FC Köln': 'FC Koln',
+    '1. FC Koln': 'FC Koln',
+    'SC Freiburg': 'Freiburg',
+    'Sport-Club Freiburg': 'Freiburg',
+    'Hamburger SV': 'Hamburg',
+    'Hamburg': 'Hamburg',
+    'TSG Hoffenheim': 'Hoffenheim',
+    'Bayer 04 Leverkusen': 'Leverkusen',
+    'Bayer Leverkusen': 'Leverkusen',
+    'Borussia Mönchengladbach': "M'gladbach",
+    'Borussia Monchengladbach': "M'gladbach",
+    '1. FSV Mainz 05': 'Mainz',
+    'Mainz 05': 'Mainz',
+    '1. FC Union Berlin': 'Union Berlin',
+    'VfB Stuttgart': 'Stuttgart',
+    'SV Werder Bremen': 'Werder Bremen',
+    'FC Augsburg': 'Augsburg',
+    'FC Schalke 04': 'Schalke 04',
+    'Schalke 04': 'Schalke 04',
+    'SV Elversberg': 'Elversberg',
+    'SC Paderborn 07': 'Paderborn',
+}
+
+CONFIG = LeagueConfig(
+    id='bundesliga', name='Bundesliga', fd_code='D1',
+    index_url='https://www.football-data.co.uk/germanym.php', currency='€',
+    second_tier_label='2. Bundesliga', fixture_feed_slug='bundesliga-2026',
+    matchweek_count=34, csv_name=CSV_NAME,
+    last_season_position=LAST_SEASON_POSITION, promoted=PROMOTED,
+    team_context=TEAM_CONTEXT, name_aliases=NAME_ALIASES,
+    season_start='2026-08-28', context_as_of='20 Aug 2026',
+)

@@ -499,63 +499,11 @@ TEAM_CONTEXT = {
 }
 
 
-def context_adjustment(display_name: str) -> dict:
-    """Translate qualitative summer context into a small multiplicative rating tweak.
-
-    Returns attack_mult, defense_mult (higher defense_mult = harder to score against)
-    and a short explanation list. Tweaks are capped so history still dominates.
-    """
-    ctx = TEAM_CONTEXT[display_name]
-    attack = 1.0
-    defense = 1.0
+def _epl_club_shocks(display_name: str) -> tuple[float, float, list[str]]:
+    """Hard-coded EPL summer shocks that net spend alone does not capture."""
+    attack = 0.0
+    defense = 0.0
     reasons: list[str] = []
-
-    spend = ctx["net_spend_m"]
-    spend_effect = max(-0.08, min(0.10, spend / 1200.0))
-    attack += spend_effect
-    defense += spend_effect * 0.5
-    if abs(spend) >= 40:
-        direction = "strengthened" if spend > 0 else "weakened"
-        reasons.append(f"Net spend ~£{spend}m ({direction} the squad on paper).")
-
-    turnover = ctx["squad_turnover"]
-    if turnover >= 0.30:
-        attack -= 0.03
-        defense -= 0.03
-        reasons.append("High squad turnover — chemistry risk in the opening weeks.")
-
-    if ctx["change_type"] == "summer":
-        if ctx["pedigree"] == "elite":
-            attack += 0.02
-            defense += 0.02
-            reasons.append(f"New coach {ctx['manager']} (elite pedigree) — small upgrade, bedding-in risk.")
-        elif ctx["pedigree"] == "unproven_pl":
-            attack -= 0.04
-            defense -= 0.05
-            reasons.append(f"New coach {ctx['manager']} has not managed in the Premier League before.")
-        else:
-            attack -= 0.015
-            defense -= 0.02
-            reasons.append(f"New coach {ctx['manager']} this summer — typical early-season dip.")
-    elif ctx["change_type"] == "mid_season":
-        attack += 0.015
-        defense += 0.015
-        reasons.append(f"{ctx['manager']} already in place from last season — continuity into 2026/27.")
-    else:
-        reasons.append(f"Manager continuity: {ctx['manager']}.")
-
-    if ctx["promoted"]:
-        # History already underweights them (no recent PL games). Extra conservative
-        # haircut because Championship form does not fully transfer.
-        attack -= 0.06
-        defense -= 0.07
-        reasons.append("Newly promoted — Premier League step-up applied.")
-        if spend >= 100:
-            attack += 0.04
-            defense += 0.03
-            reasons.append("Promotion spend is large enough to offset some of that step-up.")
-
-    # Club-specific shocks that net spend does not fully capture.
     if display_name == "Liverpool":
         attack -= 0.05
         reasons.append("Mohamed Salah departure is a direct hit to chance conversion.")
@@ -585,6 +533,94 @@ def context_adjustment(display_name: str) -> dict:
         reasons.append("Elliot Anderson sale removes the side's main creator.")
         defense += 0.02
         reasons.append("Glasner is a defensive upgrade on last season's coaching.")
+    return attack, defense, reasons
+
+
+def context_adjustment(display_name: str, league=None) -> dict:
+    """Translate qualitative summer context into a small multiplicative rating tweak.
+
+    Returns attack_mult, defense_mult (higher defense_mult = harder to score against)
+    and a short explanation list. Tweaks are capped so history still dominates.
+
+    If ``league`` is provided, use that league's TEAM_CONTEXT / currency / feeder label.
+    Otherwise fall back to the Premier League tables (legacy callers).
+    """
+    if league is not None:
+        ctx = league.team_context[display_name]
+        currency = league.currency
+        feeder = league.second_tier_label
+        league_name = league.name
+        league_id = league.id
+    else:
+        ctx = TEAM_CONTEXT[display_name]
+        currency = "£"
+        feeder = "Championship"
+        league_name = "Premier League"
+        league_id = "epl"
+
+    attack = 1.0
+    defense = 1.0
+    reasons: list[str] = []
+
+    spend = ctx["net_spend_m"]
+    spend_effect = max(-0.08, min(0.10, spend / 1200.0))
+    attack += spend_effect
+    defense += spend_effect * 0.5
+    if abs(spend) >= 40:
+        direction = "strengthened" if spend > 0 else "weakened"
+        reasons.append(f"Net spend ~{currency}{spend}m ({direction} the squad on paper).")
+
+    turnover = ctx["squad_turnover"]
+    if turnover >= 0.30:
+        attack -= 0.03
+        defense -= 0.03
+        reasons.append("High squad turnover — chemistry risk in the opening weeks.")
+
+    if ctx["change_type"] == "summer":
+        if ctx["pedigree"] == "elite":
+            attack += 0.02
+            defense += 0.02
+            reasons.append(
+                f"New coach {ctx['manager']} (elite pedigree) — small upgrade, bedding-in risk."
+            )
+        elif ctx["pedigree"] in {"unproven_pl", "unproven"}:
+            attack -= 0.04
+            defense -= 0.05
+            reasons.append(
+                f"New coach {ctx['manager']} has not managed in {league_name} before."
+            )
+        else:
+            attack -= 0.015
+            defense -= 0.02
+            reasons.append(f"New coach {ctx['manager']} this summer — typical early-season dip.")
+    elif ctx["change_type"] == "mid_season":
+        attack += 0.015
+        defense += 0.015
+        reasons.append(
+            f"{ctx['manager']} already in place from last season — continuity into 2026/27."
+        )
+    else:
+        reasons.append(f"Manager continuity: {ctx['manager']}.")
+
+    if ctx["promoted"] or display_name in (
+        set() if league is None else league.promoted
+    ) or (league is None and display_name in PROMOTED_TEAMS):
+        attack -= 0.06
+        defense -= 0.07
+        reasons.append(f"Newly promoted — {league_name} step-up from {feeder} applied.")
+        if spend >= 100:
+            attack += 0.04
+            defense += 0.03
+            reasons.append("Promotion spend is large enough to offset some of that step-up.")
+
+    for shock in ctx.get("shocks") or []:
+        reasons.append(shock)
+
+    if league_id == "epl":
+        da, dd, dr = _epl_club_shocks(display_name)
+        attack += da
+        defense += dd
+        reasons.extend(dr)
 
     attack = float(max(0.82, min(1.16, attack)))
     defense = float(max(0.82, min(1.16, defense)))

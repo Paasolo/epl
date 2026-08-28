@@ -1,4 +1,4 @@
-"""Interactive 2026/27 Premier League match predictor."""
+"""Interactive multi-league football match predictor (2026/27)."""
 
 from __future__ import annotations
 
@@ -9,7 +9,6 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from epl_predictor.context import PREMIER_LEAGUE_2026_27, PROMOTED_TEAMS, TEAM_CONTEXT
 from epl_predictor.engine import (
     MODEL_API_VERSION,
     build_backtest_rows,
@@ -19,10 +18,11 @@ from epl_predictor.engine import (
     ranked_picks,
 )
 from epl_predictor.fixtures import fixtures_for_unplayed, matchweek_options, validate_matchweeks
+from epl_predictor.leagues import LEAGUE_ORDER, LEAGUES, get_league, league_options
 from epl_predictor.results import LIVE_SEASON
 
 st.set_page_config(
-    page_title="EPL Match Predictor 2026/27",
+    page_title="Multi-League Match Predictor 2026/27",
     page_icon="⚽",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -40,18 +40,6 @@ TEXT = "#E8EEF7"
 MUTED = "#93A0B5"
 
 MAX_MATCHES = 10
-DEFAULT_FIXTURES = [
-    ("Arsenal", "Home", "Coventry City"),
-    ("Manchester United", "Away", "Hull City"),
-    ("Newcastle United", "Home", "Liverpool"),
-    ("Manchester City", "Home", "AFC Bournemouth"),
-    ("Fulham", "Home", "Chelsea"),
-    ("Brentford", "Home", "Tottenham Hotspur"),
-    ("Brighton & Hove Albion", "Home", "Aston Villa"),
-    ("Ipswich Town", "Home", "Sunderland"),
-    ("Nottingham Forest", "Home", "Leeds United"),
-    ("Everton", "Home", "Crystal Palace"),
-]
 
 st.markdown(
     f"""
@@ -121,29 +109,62 @@ st.markdown(
 )
 
 
+def active_league():
+    lid = st.session_state.get("league_id", "epl")
+    return get_league(lid)
+
+
 @st.cache_data(ttl=1800, show_spinner=False)
-def cached_results_fingerprint() -> str:
-    return current_results_fingerprint(include_live=True)
+def cached_results_fingerprint(league_id: str) -> str:
+    return current_results_fingerprint(league_id, include_live=True)
 
 
-@st.cache_resource(show_spinner="Loading calibrated Premier League ratings…")
-def load_fitted_model(api_version: int = MODEL_API_VERSION, fingerprint: str = ""):
-    # api_version + fingerprint are cache keys so Cloud rebuilds after API bumps
-    # or when new live scores appear.
-    return get_model(fingerprint or cached_results_fingerprint())
+@st.cache_resource(show_spinner="Loading calibrated league ratings…")
+def load_fitted_model(league_id: str, api_version: int = MODEL_API_VERSION, fingerprint: str = ""):
+    return get_model(league_id, fingerprint or cached_results_fingerprint(league_id))
 
 
-def refresh_training_data() -> None:
+def refresh_training_data(league_id: str | None = None) -> None:
     """Drop disk/process caches and force a live re-fetch on next load."""
-    clear_model_cache()
+    lid = league_id or st.session_state.get("league_id", "epl")
+    clear_model_cache(lid)
     cached_results_fingerprint.clear()
     load_fitted_model.clear()
 
 
-def team_label(name: str) -> str:
-    if name in PROMOTED_TEAMS:
+def reset_slate_state() -> None:
+    ids = list(st.session_state.get("match_ids", []))
+    clear_match_widget_keys(ids)
+    st.session_state.match_ids = [0, 1]
+    st.session_state.next_match_id = 2
+    for key in (
+        "last_predictions",
+        "last_ranked_table",
+        "last_ranked",
+        "last_apply_context",
+        "mw_excluded",
+        "mw_loaded",
+        "mw_complete",
+    ):
+        st.session_state.pop(key, None)
+
+
+def team_label(name: str, league) -> str:
+    if name in league.promoted:
         return f"{name}  · promoted"
     return name
+
+
+def default_fixtures(league) -> list[tuple[str, str, str]]:
+    clubs = league.clubs
+    if len(clubs) < 4:
+        return [("—", "Home", "—")]
+    pairs = []
+    for i in range(0, min(10, len(clubs) - 1), 2):
+        pairs.append((clubs[i], "Home", clubs[i + 1]))
+    while len(pairs) < 2:
+        pairs.append((clubs[0], "Home", clubs[1]))
+    return pairs
 
 
 def outcome_chart(pred: dict) -> go.Figure:
@@ -190,8 +211,8 @@ def clear_match_widget_keys(match_ids: list[int]) -> None:
             st.session_state.pop(f"{prefix}{mid}", None)
 
 
-def load_matchweek_into_state(gw: int, model) -> None:
-    remaining, excluded = fixtures_for_unplayed(gw, model.matches, season=LIVE_SEASON)
+def load_matchweek_into_state(gw: int, model, league) -> None:
+    remaining, excluded = fixtures_for_unplayed(gw, model.matches, league, season=LIVE_SEASON)
     clear_match_widget_keys(list(st.session_state.get("match_ids", [])))
     new_ids = list(range(len(remaining)))
     st.session_state.match_ids = new_ids
@@ -254,13 +275,13 @@ def export_bytes(rows: list[dict]) -> tuple[str, str]:
     return csv_buf.getvalue(), json_text
 
 
-def render_prediction(pred: dict, easiest: bool) -> None:
+def render_prediction(pred: dict, easiest: bool, league) -> None:
     ctx_h = pred["home_context"]
     ctx_a = pred["away_context"]
     chips = []
-    if pred["home_display"] in PROMOTED_TEAMS:
+    if pred["home_display"] in league.promoted:
         chips.append("Home promoted")
-    if pred["away_display"] in PROMOTED_TEAMS:
+    if pred["away_display"] in league.promoted:
         chips.append("Away promoted")
     if ctx_h["change_type"] != "none":
         chips.append(f"New coach: {ctx_h['manager']}")
@@ -307,7 +328,7 @@ def render_prediction(pred: dict, easiest: bool) -> None:
     st.plotly_chart(
         outcome_chart(pred),
         use_container_width=True,
-        key=f"chart-{pred['home_display']}-{pred['away_display']}-{pred.get('slot_id', 0)}",
+        key=f"chart-{league.id}-{pred['home_display']}-{pred['away_display']}-{pred.get('slot_id', 0)}",
     )
 
     extras = pred["extras"]
@@ -329,7 +350,7 @@ def render_prediction(pred: dict, easiest: bool) -> None:
             st.caption(f"Manager: {ctx_h['manager']}  ·  in charge since {ctx_h['manager_since']}")
             form = pred["form_home"]
             st.write(
-                f"Recent PL form: {form['sequence']}"
+                f"Recent form: {form['sequence']}"
                 + (f"  ({form['points']} pts from {form['played']})" if form["played"] else "")
             )
             st.write("Key arrivals:")
@@ -343,7 +364,7 @@ def render_prediction(pred: dict, easiest: bool) -> None:
             st.caption(f"Manager: {ctx_a['manager']}  ·  in charge since {ctx_a['manager_since']}")
             form = pred["form_away"]
             st.write(
-                f"Recent PL form: {form['sequence']}"
+                f"Recent form: {form['sequence']}"
                 + (f"  ({form['points']} pts from {form['played']})" if form["played"] else "")
             )
             st.write("Key arrivals:")
@@ -353,13 +374,23 @@ def render_prediction(pred: dict, easiest: bool) -> None:
             for reason in pred["reasons_away"]:
                 st.write(f"- {reason}")
         if pred["h2h"]:
-            st.markdown("**Head-to-head (most recent Premier League meetings)**")
+            st.markdown(f"**Head-to-head (most recent {league.name} meetings)**")
             st.dataframe(pred["h2h"], hide_index=True, use_container_width=True)
         else:
-            st.caption("No recent Premier League head-to-head in the dataset.")
+            st.caption(f"No recent {league.name} head-to-head in the dataset.")
 
 
-def render_sidebar(model) -> None:
+def render_sidebar(model, league) -> None:
+    options = league_options()
+    labels = list(options.keys())
+    current_label = next((k for k, v in options.items() if v == league.id), labels[0])
+    chosen = st.selectbox("League", labels, index=labels.index(current_label), key="league_select")
+    new_id = options[chosen]
+    if new_id != st.session_state.get("league_id", "epl"):
+        st.session_state.league_id = new_id
+        reset_slate_state()
+        st.rerun()
+
     bt = model.backtest_summary()
     st.header("Model card")
     meta = getattr(model, "training_meta", {}) or {}
@@ -382,14 +413,14 @@ def render_sidebar(model) -> None:
     elif live_status.get("message") and n_live == 0:
         st.caption(live_status["message"])
     if st.button("Refresh results", use_container_width=True, help="Re-fetch football-data.co.uk and refit"):
-        refresh_training_data()
+        refresh_training_data(league.id)
         st.rerun()
     st.write(
-        "Walk-forward ensemble: shots-based xG ratings, Dixon–Coles Poisson, "
+        f"Walk-forward ensemble for **{league.name}**: shots-based xG ratings, Dixon–Coles Poisson, "
         "Elo 1X2, season mean-reversion, and temperature calibration on the last "
-        "three Premier League seasons. Completed 2026/27 scores are merged from "
-        "football-data.co.uk. Summer 2026 signings and coaching changes "
-        "are a capped overlay. Promoted clubs are shrunk toward a Championship prior."
+        "three seasons. Completed 2026/27 scores are merged from football-data.co.uk. "
+        "Summer 2026 signings and coaching changes are a capped overlay. "
+        f"Promoted clubs are shrunk toward a {league.second_tier_label} prior."
     )
     st.metric(
         "2025/26 walk-forward accuracy",
@@ -400,29 +431,28 @@ def render_sidebar(model) -> None:
     st.caption(
         f"Log loss {bt['log_loss']:.3f} · Brier {bt.get('brier', 0):.3f} on {bt['n']} matches. "
         f"Calibration T={bt.get('temperature', 1):.2f}, Poisson weight={bt.get('blend_w', 0.7):.2f}. "
-        "A naive always-home-win rule is about 46%. Lean on High confidence calls."
+        "Lean on High confidence calls."
     )
     st.divider()
     st.caption(
-        "Context sources (as of 20 Aug 2026): Premier League manager list, "
-        "ESPN summer transfer round-up, BBC, club announcements, Wikipedia 2026/27 season page. "
-        "The transfer window remains open until 1 September."
+        f"Context sources (as of {league.context_as_of}): club announcements, transfer round-ups, "
+        f"and {league.name} season pages. Transfer windows may still be open."
     )
 
 
-def render_team_board(model) -> None:
+def render_team_board(model, league) -> None:
     st.subheader("Team strength board")
     st.caption(
-        "Ratings after walking through every Premier League match in the dataset "
+        f"Ratings after walking through every {league.name} match in the dataset "
         "(historical CSV plus any completed 2026/27 results), before summer 2026 "
         "context is applied to individual fixtures."
     )
 
     rows = []
-    for name in PREMIER_LEAGUE_2026_27:
+    for name in league.clubs:
         snap = model.snapshot(name)
         form = snap["form"]
-        ctx = TEAM_CONTEXT[name]
+        ctx = league.team_context[name]
         rows.append(
             {
                 "Team": name,
@@ -435,9 +465,9 @@ def render_team_board(model) -> None:
                 "Manager": snap["manager"],
                 "Coach change": ctx["change_type"],
                 "Promoted": "Yes" if snap["promoted"] else "",
-                "Net spend £m": ctx["net_spend_m"],
-                "Last PL game": snap["last_date"],
-                "Career PL matches": snap["matches"],
+                f"Net spend {league.currency}m": ctx["net_spend_m"],
+                "Last league game": snap["last_date"],
+                "Career league matches": snap["matches"],
             }
         )
 
@@ -459,26 +489,27 @@ def render_team_board(model) -> None:
     st.download_button(
         "Download team board (CSV)",
         data=csv_buf.getvalue(),
-        file_name="epl_team_strength_board.csv",
+        file_name=f"{league.id}_team_strength_board.csv",
         mime="text/csv",
         use_container_width=True,
     )
 
 
-def render_backtest_tab(model) -> None:
+def render_backtest_tab(model, league) -> None:
     st.subheader("Backtest explorer")
     st.caption(
-        "Walk-forward 2025/26 predictions: each match is scored using only earlier history, "
+        f"Walk-forward 2025/26 {league.name} predictions: each match is scored using only earlier history, "
         "then calibrated with the same blend and temperature used in the live app."
     )
     try:
         rows = build_backtest_rows(model, "2025/26")
-    except Exception as exc:  # noqa: BLE001 — show a clean recovery path in the UI
+    except Exception as exc:  # noqa: BLE001
         st.error(f"Could not build backtest rows ({type(exc).__name__}). Rebuilding model cache…")
-        refresh_training_data()
+        refresh_training_data(league.id)
         model = load_fitted_model(
+            league.id,
             api_version=MODEL_API_VERSION,
-            fingerprint=cached_results_fingerprint(),
+            fingerprint=cached_results_fingerprint(league.id),
         )
         rows = build_backtest_rows(model, "2025/26")
     if not rows:
@@ -487,7 +518,7 @@ def render_backtest_tab(model) -> None:
             "(needed once after upgrading the app)."
         )
         if st.button("Rebuild model cache", type="primary"):
-            refresh_training_data()
+            refresh_training_data(league.id)
             st.rerun()
         return
 
@@ -556,18 +587,16 @@ def render_backtest_tab(model) -> None:
         xaxis=dict(color=MUTED, title="Month"),
         font=dict(color=TEXT),
     )
-    st.plotly_chart(chart, use_container_width=True, key="backtest_month_chart")
+    st.plotly_chart(chart, use_container_width=True, key=f"backtest_month_chart_{league.id}")
 
     st.markdown("**Biggest misses** (wrong calls with the highest model probability)")
     misses = frame.loc[~frame["correct"]].sort_values("best_prob", ascending=False).head(15)
     if misses.empty:
-        st.info("No misses in this sample — every calibrated pick matched the result.")
+        st.caption("No misses in this sample.")
     else:
         miss_view = pd.DataFrame(
             {
-                "Date": [
-                    d.strftime("%d %b %Y") if pd.notna(d) else "—" for d in misses["date"]
-                ],
+                "Date": [d.strftime("%d %b %Y") if pd.notna(d) else "—" for d in misses["date"]],
                 "Match": misses["match"].to_list(),
                 "Score": misses["score"].to_list(),
                 "Predicted": misses["predicted"].map({"H": "Home", "D": "Draw", "A": "Away"}).to_list(),
@@ -578,23 +607,22 @@ def render_backtest_tab(model) -> None:
         )
         st.dataframe(miss_view, hide_index=True, use_container_width=True)
 
-    export = frame.copy()
-    export["date"] = export["date"].map(lambda d: d.strftime("%Y-%m-%d") if pd.notna(d) else "")
     csv_buf = StringIO()
-    export.to_csv(csv_buf, index=False)
+    frame.to_csv(csv_buf, index=False)
     st.download_button(
-        "Download 2025/26 backtest rows (CSV)",
+        "Download backtest rows (CSV)",
         data=csv_buf.getvalue(),
-        file_name="epl_backtest_2025_26.csv",
+        file_name=f"{league.id}_backtest_2025_26.csv",
         mime="text/csv",
         use_container_width=True,
-        key="dl_backtest",
+        key=f"dl_backtest_{league.id}",
     )
 
 
-def render_predict_tab(model) -> None:
-    teams = PREMIER_LEAGUE_2026_27
-    labels = {t: team_label(t) for t in teams}
+def render_predict_tab(model, league) -> None:
+    teams = league.clubs
+    labels = {t: team_label(t, league) for t in teams}
+    defaults = default_fixtures(league)
 
     if "match_ids" not in st.session_state:
         st.session_state.match_ids = [0, 1]
@@ -614,14 +642,28 @@ def render_predict_tab(model) -> None:
         "Turn off for a history-only lean. The ranked table always shows the overlay effect.",
     )
 
-    gw_labels = matchweek_options()
+    gw_labels = matchweek_options(league)
     load_c1, load_c2, load_c3 = st.columns([2.4, 1.2, 1.2])
     with load_c1:
-        gw_label = st.selectbox("Official matchweek", list(gw_labels.keys()), key="gw_select")
+        if gw_labels:
+            gw_label = st.selectbox("Official matchweek", list(gw_labels.keys()), key=f"gw_select_{league.id}")
+        else:
+            gw_label = None
+            st.selectbox(
+                "Official matchweek",
+                ["No fixture feed — use custom slate"],
+                disabled=True,
+                key=f"gw_select_{league.id}_empty",
+            )
     with load_c2:
         st.markdown("<div style='height: 1.7rem'></div>", unsafe_allow_html=True)
-        if st.button("Load matchweek", use_container_width=True, type="secondary"):
-            load_matchweek_into_state(gw_labels[gw_label], model)
+        if st.button(
+            "Load matchweek",
+            use_container_width=True,
+            type="secondary",
+            disabled=not gw_labels,
+        ):
+            load_matchweek_into_state(gw_labels[gw_label], model, league)
             st.rerun()
     with load_c3:
         st.markdown("<div style='height: 1.7rem'></div>", unsafe_allow_html=True)
@@ -651,13 +693,13 @@ def render_predict_tab(model) -> None:
     if not ids:
         st.caption("No fixtures on the slate. Load a matchweek with remaining games, or add a match.")
     for idx, match_id in enumerate(ids):
-        club_default, venue_default, opp_default = DEFAULT_FIXTURES[match_id % len(DEFAULT_FIXTURES)]
+        club_default, venue_default, opp_default = defaults[match_id % len(defaults)]
         st.markdown(f"**Match {idx + 1}**")
         c1, c2, c3, c4 = st.columns([2.2, 1.2, 2.2, 0.7])
         with c1:
             club_key = f"club_{match_id}"
-            if club_key not in st.session_state:
-                st.session_state[club_key] = club_default
+            if club_key not in st.session_state or st.session_state[club_key] not in teams:
+                st.session_state[club_key] = club_default if club_default in teams else teams[0]
             club = st.selectbox(
                 "Club",
                 teams,
@@ -752,11 +794,15 @@ def render_predict_tab(model) -> None:
         st.session_state.last_ranked = ranked
         st.session_state.last_ranked_table = table_rows
         st.session_state.last_apply_context = apply_context
+        st.session_state.last_league_id = league.id
 
     preds = st.session_state.get("last_predictions")
     ranked = st.session_state.get("last_ranked")
     table_rows = st.session_state.get("last_ranked_table")
     if not preds or not ranked or not table_rows:
+        return
+    if st.session_state.get("last_league_id") != league.id:
+        st.info("League changed since the last prediction. Click Predict again to refresh.")
         return
 
     current_keys = {(h, a) for _, h, a in fixtures}
@@ -814,19 +860,19 @@ def render_predict_tab(model) -> None:
         st.download_button(
             "Download ranked slate (CSV)",
             data=csv_text,
-            file_name="epl_ranked_predictions.csv",
+            file_name=f"{league.id}_ranked_predictions.csv",
             mime="text/csv",
             use_container_width=True,
-            key="dl_csv",
+            key=f"dl_csv_{league.id}",
         )
     with dl2:
         st.download_button(
             "Download ranked slate (JSON)",
             data=json_text,
-            file_name="epl_ranked_predictions.json",
+            file_name=f"{league.id}_ranked_predictions.json",
             mime="application/json",
             use_container_width=True,
-            key="dl_json",
+            key=f"dl_json_{league.id}",
         )
 
     for start in range(0, len(preds), 2):
@@ -834,41 +880,59 @@ def render_predict_tab(model) -> None:
         chunk = preds[start : start + 2]
         for col, pred in zip(cols, chunk):
             with col:
-                render_prediction(pred, pred["is_easiest"])
+                render_prediction(pred, pred["is_easiest"], league)
 
 
 def main() -> None:
-    fingerprint = cached_results_fingerprint()
-    model = load_fitted_model(api_version=MODEL_API_VERSION, fingerprint=fingerprint)
-    mw_problems = validate_matchweeks()
-    if mw_problems:
+    if "league_id" not in st.session_state:
+        st.session_state.league_id = "epl"
+
+    league = active_league()
+    fingerprint = cached_results_fingerprint(league.id)
+    model = load_fitted_model(
+        league.id,
+        api_version=MODEL_API_VERSION,
+        fingerprint=fingerprint,
+    )
+    mw_problems = validate_matchweeks(league)
+    if mw_problems and league.fixture_feed_slug:
         st.warning("Fixture slate issue: " + "; ".join(mw_problems[:3]))
 
     st.markdown(
-        """
+        f"""
         <div class="hero">
-          <h1>Premier League match predictor</h1>
+          <h1>{league.name} match predictor</h1>
           <p>Load an official matchweek or build a custom slate. The model is fitted on
-          Premier League history in <code>epl_final.csv</code> plus completed 2026/27 scores
-          from football-data.co.uk, then adjusted for this summer’s signings and coaching.
-          Finished fixtures are skipped when you load a matchweek.</p>
+          {league.name} history (2000/01 onward from football-data.co.uk) plus completed 2026/27 scores,
+          then adjusted for this summer’s signings and coaching.
+          Finished fixtures are skipped when you load a matchweek. Switch leagues in the sidebar.</p>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
     with st.sidebar:
-        render_sidebar(model)
+        render_sidebar(model, league)
+
+    # Re-read after sidebar may have switched league
+    league = active_league()
+    if league.id != getattr(model, "league", league).id:
+        fingerprint = cached_results_fingerprint(league.id)
+        model = load_fitted_model(
+            league.id,
+            api_version=MODEL_API_VERSION,
+            fingerprint=fingerprint,
+        )
 
     tab_predict, tab_teams, tab_backtest = st.tabs(
         ["Predict matches", "Team strength", "Backtest explorer"]
     )
     with tab_predict:
-        render_predict_tab(model)
+        render_predict_tab(model, league)
     with tab_teams:
-        render_team_board(model)
+        render_team_board(model, league)
     with tab_backtest:
-        render_backtest_tab(model)
+        render_backtest_tab(model, league)
 
 
 if __name__ == "__main__":

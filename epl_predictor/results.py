@@ -1,9 +1,4 @@
-"""Live Premier League results: fetch, merge, and matchweek filtering.
-
-Completed 2026/27 scores are pulled preferentially from football-data.co.uk
-(same provider lineage as epl_final.csv). When that season file is not
-published yet, we fall back to the fixturedownload.com JSON feed.
-"""
+"""Live results: fetch, merge, and matchweek filtering (multi-league)."""
 
 from __future__ import annotations
 
@@ -16,40 +11,10 @@ from urllib.request import Request, urlopen
 
 import pandas as pd
 
-from .context import CSV_NAME
-from .fixtures import fixtures_for
+from epl_predictor.leagues.base import LeagueConfig
 
 LIVE_SEASON = "2026/27"
-# football-data season folder is YY next-YY, e.g. 2627 for 2026/27.
-# The E0 file appears once their England page lists Premier League for the season.
-LIVE_SEASON_URLS = {
-    "2026/27": [
-        "https://www.football-data.co.uk/mmz4281/2627/E0.csv",
-        "http://www.football-data.co.uk/mmz4281/2627/E0.csv",
-    ],
-}
 
-ENGLAND_INDEX_URL = "https://www.football-data.co.uk/englandm.php"
-FIXTUREDOWNLOAD_JSON = {
-    "2026/27": "https://fixturedownload.com/feed/json/epl-2026",
-}
-
-# fixturedownload short names -> epl_final / football-data CSV names
-_FD_NAME_ALIASES = {
-    "Man Utd": "Man United",
-    "Spurs": "Tottenham",
-    "Man City": "Man City",
-    "Nott'm Forest": "Nott'm Forest",
-    "Bournemouth": "Bournemouth",
-    "Brighton": "Brighton",
-    "Newcastle": "Newcastle",
-    "Hull": "Hull",
-    "Ipswich": "Ipswich",
-    "Coventry": "Coventry",
-    "Leeds": "Leeds",
-}
-
-# football-data.co.uk short names -> epl_final schema
 _FD_TO_INTERNAL = {
     "Date": "MatchDate",
     "HomeTeam": "HomeTeam",
@@ -103,7 +68,7 @@ SCHEMA_COLS = [
 def _http_get(url: str, timeout: float = 20.0) -> bytes:
     req = Request(
         url,
-        headers={"User-Agent": "Mozilla/5.0 (compatible; epl-predictor/1.0)"},
+        headers={"User-Agent": "Mozilla/5.0 (compatible; multi-league-predictor/1.0)"},
     )
     with urlopen(req, timeout=timeout) as resp:
         return resp.read()
@@ -112,11 +77,6 @@ def _http_get(url: str, timeout: float = 20.0) -> bytes:
 def _looks_like_results_csv(raw: bytes) -> bool:
     head = raw.lstrip(b"\xef\xbb\xbf")[:200].decode("utf-8", errors="ignore").lower()
     return "hometeam" in head and ("fthg" in head or "fulltimehomegoals" in head)
-
-
-def _canon_team(name: str) -> str:
-    name = str(name).strip()
-    return _FD_NAME_ALIASES.get(name, name)
 
 
 def _empty_status(season: str, url: str | None = None) -> dict:
@@ -131,13 +91,30 @@ def _empty_status(season: str, url: str | None = None) -> dict:
     }
 
 
-def _discover_e0_url(season_code: str = "2627") -> str | None:
-    """Parse englandm.php for an E0.csv link matching the season folder."""
+def _season_folder(season: str = LIVE_SEASON) -> str:
+    parts = season.split("/")
+    if len(parts) == 2 and len(parts[0]) >= 2 and len(parts[1]) >= 2:
+        return parts[0][-2:] + parts[1][-2:]
+    return "2627"
+
+
+def live_urls(league: LeagueConfig, season: str = LIVE_SEASON) -> list[str]:
+    code = _season_folder(season)
+    base = f"https://www.football-data.co.uk/mmz4281/{code}/{league.fd_code}.csv"
+    http = f"http://www.football-data.co.uk/mmz4281/{code}/{league.fd_code}.csv"
+    return [base, http]
+
+
+def _discover_league_url(league: LeagueConfig, season_code: str = "2627") -> str | None:
+    """Parse the league index page for a CSV link matching the season folder."""
     try:
-        html = _http_get(ENGLAND_INDEX_URL).decode("utf-8", errors="ignore")
+        html = _http_get(league.index_url).decode("utf-8", errors="ignore")
     except (HTTPError, URLError, TimeoutError, OSError):
         return None
-    pattern = rf'https?://[^"\']*mmz4281/{season_code}/E0\.csv|mmz4281/{season_code}/E0\.csv'
+    pattern = (
+        rf'https?://[^"\']*mmz4281/{season_code}/{league.fd_code}\.csv|'
+        rf'mmz4281/{season_code}/{league.fd_code}\.csv'
+    )
     m = re.search(pattern, html, flags=re.I)
     if not m:
         return None
@@ -147,20 +124,51 @@ def _discover_e0_url(season_code: str = "2627") -> str | None:
     return "https://www.football-data.co.uk/" + href.lstrip("/")
 
 
-def _fetch_football_data(season: str, timeout: float) -> tuple[pd.DataFrame, dict]:
-    urls = list(LIVE_SEASON_URLS.get(season) or [])
-    status = _empty_status(season, urls[0] if urls else None)
-    if not urls:
-        status["message"] = f"No football-data URL configured for {season}."
-        status["soft"] = True
-        return pd.DataFrame(columns=SCHEMA_COLS), status
+def _canon_with_aliases(name: str, aliases: dict[str, str] | None) -> str:
+    name = str(name).strip()
+    if not aliases:
+        return name
+    return aliases.get(name, name)
 
-    parts = season.split("/")
-    if len(parts) == 2 and len(parts[0]) >= 2 and len(parts[1]) >= 2:
-        code = parts[0][-2:] + parts[1][-2:]
-        discovered = _discover_e0_url(code)
-        if discovered and discovered not in urls:
-            urls.insert(0, discovered)
+
+def normalize_football_data(
+    df: pd.DataFrame,
+    season: str = LIVE_SEASON,
+    aliases: dict[str, str] | None = None,
+) -> pd.DataFrame:
+    """Map football-data columns onto the shared schema; keep completed only."""
+    if df is None or df.empty:
+        return pd.DataFrame(columns=SCHEMA_COLS)
+
+    df = df.copy()
+    df.columns = [str(c).replace("\ufeff", "").strip() for c in df.columns]
+    rename = {src: dst for src, dst in _FD_TO_INTERNAL.items() if src in df.columns}
+    out = df.rename(columns=rename).copy()
+    for col in SCHEMA_COLS:
+        if col not in out.columns and col != "Season":
+            out[col] = pd.NA
+    out["Season"] = season
+    out["MatchDate"] = _parse_match_dates(out["MatchDate"])
+    out = out.dropna(subset=["MatchDate", "HomeTeam", "AwayTeam"])
+    for col in ("FullTimeHomeGoals", "FullTimeAwayGoals"):
+        out[col] = pd.to_numeric(out[col], errors="coerce")
+    out = out.dropna(subset=["FullTimeHomeGoals", "FullTimeAwayGoals"])
+    out["HomeTeam"] = out["HomeTeam"].map(lambda n: _canon_with_aliases(n, aliases))
+    out["AwayTeam"] = out["AwayTeam"].map(lambda n: _canon_with_aliases(n, aliases))
+    return out[SCHEMA_COLS].reset_index(drop=True)
+
+
+def _fetch_football_data(
+    league: LeagueConfig,
+    season: str,
+    timeout: float,
+) -> tuple[pd.DataFrame, dict]:
+    urls = live_urls(league, season)
+    status = _empty_status(season, urls[0] if urls else None)
+    code = _season_folder(season)
+    discovered = _discover_league_url(league, code)
+    if discovered and discovered not in urls:
+        urls.insert(0, discovered)
 
     errors: list[str] = []
     for url in urls:
@@ -172,7 +180,7 @@ def _fetch_football_data(season: str, timeout: float) -> tuple[pd.DataFrame, dic
                 status["soft"] = True
                 continue
             df = pd.read_csv(io.BytesIO(raw))
-            live = normalize_football_data(df, season=season)
+            live = normalize_football_data(df, season=season, aliases=league.name_aliases)
             status["ok"] = True
             status["source"] = "football-data.co.uk"
             status["n_live"] = int(len(live))
@@ -183,7 +191,6 @@ def _fetch_football_data(season: str, timeout: float) -> tuple[pd.DataFrame, dic
             )
             return live, status
         except HTTPError as exc:
-            # 300/404 usually means the Premier League file is not published yet.
             if exc.code in {300, 404}:
                 errors.append(f"{url}: HTTP {exc.code} (season file not published yet)")
                 status["soft"] = True
@@ -196,14 +203,20 @@ def _fetch_football_data(season: str, timeout: float) -> tuple[pd.DataFrame, dic
     return pd.DataFrame(columns=SCHEMA_COLS), status
 
 
-def _fetch_fixturedownload(season: str, timeout: float) -> tuple[pd.DataFrame, dict]:
-    url = FIXTUREDOWNLOAD_JSON.get(season)
-    status = _empty_status(season, url)
-    if not url:
-        status["message"] = f"No fixturedownload feed for {season}."
+def _fetch_fixturedownload(
+    league: LeagueConfig,
+    season: str,
+    timeout: float,
+) -> tuple[pd.DataFrame, dict]:
+    slug = league.fixture_feed_slug
+    status = _empty_status(season, None)
+    if not slug:
+        status["message"] = f"No fixturedownload feed configured for {league.name}."
         status["soft"] = True
         return pd.DataFrame(columns=SCHEMA_COLS), status
 
+    url = f"https://fixturedownload.com/feed/json/{slug}"
+    status["url"] = url
     try:
         raw = _http_get(url, timeout=timeout)
         payload = json.loads(raw.decode("utf-8"))
@@ -216,8 +229,8 @@ def _fetch_fixturedownload(season: str, timeout: float) -> tuple[pd.DataFrame, d
             ag = match.get("AwayTeamScore")
             if hg is None or ag is None:
                 continue
-            home = _canon_team(match.get("HomeTeam", ""))
-            away = _canon_team(match.get("AwayTeam", ""))
+            home = league.canon_team(match.get("HomeTeam", ""))
+            away = league.canon_team(match.get("AwayTeam", ""))
             if not home or not away:
                 continue
             try:
@@ -252,7 +265,7 @@ def _fetch_fixturedownload(season: str, timeout: float) -> tuple[pd.DataFrame, d
         status["n_live"] = int(len(live))
         status["message"] = (
             f"Fetched {len(live)} completed {season} match(es) from fixturedownload.com"
-            " (football-data.co.uk Premier League file not published yet)."
+            f" ({league.name} football-data file not published yet)."
             if len(live)
             else f"No completed {season} scores in the fixturedownload feed yet."
         )
@@ -263,19 +276,16 @@ def _fetch_fixturedownload(season: str, timeout: float) -> tuple[pd.DataFrame, d
 
 
 def fetch_season_results(
+    league: LeagueConfig,
     season: str = LIVE_SEASON,
     timeout: float = 20.0,
 ) -> tuple[pd.DataFrame, dict]:
-    """Download completed matches for a season. On failure returns empty + status.
-
-    Prefers football-data.co.uk; falls back to fixturedownload.com JSON when the
-    Premier League E0 file is not published yet (common early in the season).
-    """
-    live, status = _fetch_football_data(season, timeout=timeout)
+    """Download completed matches for a season. On failure returns empty + status."""
+    live, status = _fetch_football_data(league, season, timeout=timeout)
     if status.get("ok") and status.get("n_live", 0) > 0:
         return live, status
 
-    alt, alt_status = _fetch_fixturedownload(season, timeout=timeout)
+    alt, alt_status = _fetch_fixturedownload(league, season, timeout=timeout)
     if alt_status.get("ok"):
         return alt, alt_status
 
@@ -284,7 +294,7 @@ def fetch_season_results(
         combined["soft"] = True
         combined["message"] = (
             f"Live {season} results are not published on football-data.co.uk yet "
-            "(Premier League CSV still missing). Using historical CSV only until scores appear."
+            f"({league.name} CSV still missing). Using historical CSV only until scores appear."
         )
     else:
         combined["message"] = (
@@ -295,27 +305,20 @@ def fetch_season_results(
     return pd.DataFrame(columns=SCHEMA_COLS), combined
 
 
-def normalize_football_data(df: pd.DataFrame, season: str = LIVE_SEASON) -> pd.DataFrame:
-    """Map football-data E0 columns onto the epl_final.csv schema; keep completed only."""
-    if df is None or df.empty:
-        return pd.DataFrame(columns=SCHEMA_COLS)
-
-    df = df.copy()
-    df.columns = [str(c).replace("\ufeff", "").strip() for c in df.columns]
-    rename = {src: dst for src, dst in _FD_TO_INTERNAL.items() if src in df.columns}
-    out = df.rename(columns=rename).copy()
-    for col in SCHEMA_COLS:
-        if col not in out.columns and col != "Season":
-            out[col] = pd.NA
-    out["Season"] = season
-    out["MatchDate"] = pd.to_datetime(out["MatchDate"], dayfirst=True, errors="coerce")
-    out = out.dropna(subset=["MatchDate", "HomeTeam", "AwayTeam"])
-    for col in ("FullTimeHomeGoals", "FullTimeAwayGoals"):
-        out[col] = pd.to_numeric(out[col], errors="coerce")
-    out = out.dropna(subset=["FullTimeHomeGoals", "FullTimeAwayGoals"])
-    out["HomeTeam"] = out["HomeTeam"].map(_canon_team)
-    out["AwayTeam"] = out["AwayTeam"].map(_canon_team)
-    return out[SCHEMA_COLS].reset_index(drop=True)
+def _parse_match_dates(series: pd.Series) -> pd.Series:
+    """Parse football-data dates (dd/mm/yy) and ISO dates from our cached CSVs."""
+    as_str = series.astype(str)
+    iso_mask = as_str.str.match(r"^\d{4}-\d{2}-\d{2}", na=False)
+    parsed = pd.Series(pd.NaT, index=series.index, dtype="datetime64[ns]")
+    if iso_mask.any():
+        parsed.loc[iso_mask] = pd.to_datetime(series.loc[iso_mask], errors="coerce")
+    rest = ~iso_mask & series.notna()
+    if rest.any():
+        parsed.loc[rest] = pd.to_datetime(series.loc[rest], dayfirst=True, errors="coerce")
+        still_missing = rest & parsed.isna()
+        if still_missing.any():
+            parsed.loc[still_missing] = pd.to_datetime(series.loc[still_missing], errors="coerce")
+    return parsed
 
 
 def merge_history_and_live(base_df: pd.DataFrame, live_df: pd.DataFrame) -> pd.DataFrame:
@@ -325,7 +328,7 @@ def merge_history_and_live(base_df: pd.DataFrame, live_df: pd.DataFrame) -> pd.D
         return pd.DataFrame(columns=SCHEMA_COLS)
     merged = pd.concat(frames, ignore_index=True)
     if "MatchDate" in merged.columns:
-        merged["MatchDate"] = pd.to_datetime(merged["MatchDate"], dayfirst=True, errors="coerce")
+        merged["MatchDate"] = _parse_match_dates(merged["MatchDate"])
     merged = merged.dropna(subset=["MatchDate", "HomeTeam", "AwayTeam"], how="any")
     merged = merged.drop_duplicates(subset=["MatchDate", "HomeTeam", "AwayTeam"], keep="last")
     return merged.sort_values(["MatchDate", "HomeTeam", "AwayTeam"]).reset_index(drop=True)
@@ -342,7 +345,11 @@ def results_fingerprint(df: pd.DataFrame) -> str:
     return f"{len(df)}|{latest}"
 
 
-def training_meta(df: pd.DataFrame, live_status: dict | None = None) -> dict:
+def training_meta(
+    df: pd.DataFrame,
+    live_status: dict | None = None,
+    season: str = LIVE_SEASON,
+) -> dict:
     """Summary used by the UI and model cache."""
     n = 0 if df is None or df.empty else len(df)
     through = None
@@ -352,7 +359,7 @@ def training_meta(df: pd.DataFrame, live_status: dict | None = None) -> dict:
             through = pd.Timestamp(dates.max())
     live_n = 0
     if df is not None and not df.empty and "Season" in df.columns:
-        live_n = int((df["Season"].astype(str) == LIVE_SEASON).sum())
+        live_n = int((df["Season"].astype(str) == season).sum())
     return {
         "fingerprint": results_fingerprint(df),
         "n_matches": n,
@@ -376,7 +383,10 @@ def played_fixture_keys(df: pd.DataFrame, season: str = LIVE_SEASON) -> set[tupl
     return keys
 
 
-def score_lookup(df: pd.DataFrame, season: str = LIVE_SEASON) -> dict[tuple[str, str], tuple[int, int]]:
+def score_lookup(
+    df: pd.DataFrame,
+    season: str = LIVE_SEASON,
+) -> dict[tuple[str, str], tuple[int, int]]:
     """(home_csv, away_csv) -> (hg, ag) for completed matches in season."""
     if df is None or df.empty:
         return {}
@@ -396,17 +406,20 @@ def score_lookup(df: pd.DataFrame, season: str = LIVE_SEASON) -> dict[tuple[str,
 def split_matchweek_fixtures(
     gw: int,
     matches: pd.DataFrame,
+    league: LeagueConfig,
     season: str = LIVE_SEASON,
 ) -> tuple[list[tuple[str, str]], list[dict]]:
     """Split official GW fixtures into unplayed display pairs and excluded score rows."""
-    pairs = fixtures_for(gw)
+    from epl_predictor.fixtures import fixtures_for
+
+    pairs = fixtures_for(gw, league)
     played = played_fixture_keys(matches, season=season)
     scores = score_lookup(matches, season=season)
     remaining: list[tuple[str, str]] = []
     excluded: list[dict] = []
     for home_d, away_d in pairs:
-        home_csv = CSV_NAME.get(home_d, home_d)
-        away_csv = CSV_NAME.get(away_d, away_d)
+        home_csv = league.csv_name.get(home_d, home_d)
+        away_csv = league.csv_name.get(away_d, away_d)
         key = (home_csv, away_csv)
         if key in played:
             hg, ag = scores.get(key, (None, None))
@@ -432,9 +445,8 @@ def split_matchweek_fixtures(
 
 
 def read_base_csv(path: Path) -> pd.DataFrame:
-    """Raw read of epl_final.csv (pre-clean)."""
+    """Raw read of a history CSV (pre-clean)."""
     df = pd.read_csv(path)
-    # Align column set for merge; cleaning happens in engine.load_matches.
     for col in SCHEMA_COLS:
         if col not in df.columns:
             df[col] = pd.NA

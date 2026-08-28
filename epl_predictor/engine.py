@@ -1,4 +1,4 @@
-"""Premier League match-outcome model (2000/01–2025/26).
+"""Multi-league match-outcome model (2000/01–present).
 
 Pipeline
 --------
@@ -13,7 +13,7 @@ Pipeline
 6. Apply 2026/27 signings / coaching as a small capped overlay.
 
 History always dominates the summer overlay. Promoted clubs are shrunk
-toward a Championship-to-Premier-League prior.
+toward a second-tier-to-top-flight prior.
 """
 
 from __future__ import annotations
@@ -28,15 +28,11 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from .context import (
-    CSV_NAME,
-    DISPLAY_NAME,
-    LAST_SEASON_POSITION,
-    PROMOTED_TEAMS,
-    TEAM_CONTEXT,
-    context_adjustment,
-)
-from .results import (
+from epl_predictor.context import context_adjustment
+from epl_predictor.history import ensure_history
+from epl_predictor.leagues import get_league
+from epl_predictor.leagues.base import LeagueConfig
+from epl_predictor.results import (
     LIVE_SEASON,
     fetch_season_results,
     merge_history_and_live,
@@ -45,10 +41,8 @@ from .results import (
     training_meta,
 )
 
-DATA_PATH = Path(__file__).resolve().parent.parent / "epl_final.csv"
-CACHE_PATH = Path(__file__).resolve().parent / "model_cache.pkl"
 # Bump when the pickled model schema or public API changes.
-MODEL_API_VERSION = 4
+MODEL_API_VERSION = 5
 
 ELO_MEAN = 1500.0
 ELO_HFA = 62.0
@@ -65,9 +59,8 @@ DC_RHO = -0.11
 PROMOTED_ATTACK_PRIOR = 0.84
 PROMOTED_DEFENSE_PRIOR = 0.82
 HOLDOUT_SEASONS = ("2023/24", "2024/25", "2025/26")
-# Season-start fallback when no match dates are available yet.
-SEASON_START_AS_OF = pd.Timestamp("2026-08-21")
-AS_OF_KICKOFF = SEASON_START_AS_OF
+DEFAULT_SEASON_START = pd.Timestamp("2026-08-15")
+AS_OF_KICKOFF = DEFAULT_SEASON_START
 
 _K = np.arange(MAX_GOALS + 1)
 _LOG_FACT = np.array([math.lgamma(k + 1.0) for k in _K])
@@ -85,8 +78,10 @@ def _new_recent() -> deque:
 
 def _clean_matches(df: pd.DataFrame) -> pd.DataFrame:
     """Normalize dtypes, rebuild FTR from goals, add xG proxies."""
+    from epl_predictor.results import _parse_match_dates
+
     df = df.copy()
-    df["MatchDate"] = pd.to_datetime(df["MatchDate"], dayfirst=True, errors="coerce")
+    df["MatchDate"] = _parse_match_dates(df["MatchDate"])
     df = df.dropna(subset=["MatchDate", "HomeTeam", "AwayTeam"])
     for col in (
         "FullTimeHomeGoals",
@@ -113,7 +108,7 @@ def _clean_matches(df: pd.DataFrame) -> pd.DataFrame:
     return df.sort_values(["MatchDate", "HomeTeam", "AwayTeam"]).reset_index(drop=True)
 
 
-def compute_as_of(matches: pd.DataFrame) -> pd.Timestamp:
+def compute_as_of(matches: pd.DataFrame, league: LeagueConfig | None = None) -> pd.Timestamp:
     """Prediction 'now': day after latest training match, at least today / season start."""
     today = pd.Timestamp.now().normalize()
     latest = None
@@ -121,21 +116,29 @@ def compute_as_of(matches: pd.DataFrame) -> pd.Timestamp:
         dates = pd.to_datetime(matches["MatchDate"], errors="coerce").dropna()
         if not dates.empty:
             latest = pd.Timestamp(dates.max()).normalize()
-    candidates = [SEASON_START_AS_OF, today]
+    season_start = (
+        pd.Timestamp(league.season_start)
+        if league is not None
+        else DEFAULT_SEASON_START
+    )
+    candidates = [season_start, today]
     if latest is not None:
         candidates.append(latest + pd.Timedelta(days=1))
     return max(candidates)
 
 
 def load_matches(
-    path: Path | None = None,
+    league: LeagueConfig | str = "epl",
     include_live: bool = True,
 ) -> tuple[pd.DataFrame, dict]:
     """Load historical CSV, optionally merge live 2026/27 results, and clean.
 
     Returns (matches, meta) where meta includes fingerprint and live fetch status.
     """
-    base = read_base_csv(path or DATA_PATH)
+    if isinstance(league, str):
+        league = get_league(league)
+    ensure_history(league)
+    base = read_base_csv(league.history_path)
     live_status: dict = {
         "ok": False,
         "n_live": 0,
@@ -144,16 +147,20 @@ def load_matches(
     }
     live = pd.DataFrame()
     if include_live:
-        live, live_status = fetch_season_results(LIVE_SEASON)
+        live, live_status = fetch_season_results(league, LIVE_SEASON)
     merged = merge_history_and_live(base, live)
     cleaned = _clean_matches(merged)
     meta = training_meta(cleaned, live_status=live_status)
+    meta["league_id"] = league.id
     return cleaned, meta
 
 
-def current_results_fingerprint(include_live: bool = True) -> str:
+def current_results_fingerprint(
+    league: LeagueConfig | str = "epl",
+    include_live: bool = True,
+) -> str:
     """Fingerprint of the training frame used for Streamlit / lru cache keys."""
-    _matches, meta = load_matches(include_live=include_live)
+    _matches, meta = load_matches(league, include_live=include_live)
     return str(meta["fingerprint"])
 
 
@@ -240,7 +247,15 @@ class TeamState:
 
 
 class LeagueModel:
-    def __init__(self, matches: pd.DataFrame, meta: dict | None = None):
+    def __init__(
+        self,
+        matches: pd.DataFrame,
+        league: LeagueConfig | str = "epl",
+        meta: dict | None = None,
+    ):
+        if isinstance(league, str):
+            league = get_league(league)
+        self.league = league
         self.matches = matches
         self.states: dict[str, TeamState] = defaultdict(TeamState)
         self.league_home = 1.48
@@ -252,7 +267,7 @@ class LeagueModel:
         self._fitted = False
         self.training_meta = meta or training_meta(matches)
         self.results_fingerprint = str(self.training_meta.get("fingerprint", results_fingerprint(matches)))
-        self.as_of = compute_as_of(matches)
+        self.as_of = compute_as_of(matches, league)
 
     def _as_of(self, as_of: pd.Timestamp | None = None) -> pd.Timestamp:
         return as_of if as_of is not None else getattr(self, "as_of", AS_OF_KICKOFF)
@@ -486,8 +501,8 @@ class LeagueModel:
         as_of = self._as_of(as_of)
         if as_of < pd.Timestamp("2026-06-01"):
             return 1.0, 1.0
-        display = DISPLAY_NAME.get(csv_name, csv_name)
-        if display not in PROMOTED_TEAMS:
+        display = self.league.to_display(csv_name)
+        if display not in self.league.promoted:
             return 1.0, 1.0
         st = self.states[csv_name]
         if st.last_date is None:
@@ -518,14 +533,14 @@ class LeagueModel:
         lam_h *= ph_att / max(pa_def, 0.6)
         lam_a *= pa_att / max(ph_def, 0.6)
         if apply_context:
-            home_disp = DISPLAY_NAME.get(home_csv, home_csv)
-            away_disp = DISPLAY_NAME.get(away_csv, away_csv)
-            if home_disp in TEAM_CONTEXT:
-                adj = context_adjustment(home_disp)
+            home_disp = self.league.to_display(home_csv)
+            away_disp = self.league.to_display(away_csv)
+            if home_disp in self.league.team_context:
+                adj = context_adjustment(home_disp, self.league)
                 lam_h *= adj["attack_mult"]
                 lam_a /= adj["defense_mult"]
-            if away_disp in TEAM_CONTEXT:
-                adj = context_adjustment(away_disp)
+            if away_disp in self.league.team_context:
+                adj = context_adjustment(away_disp, self.league)
                 lam_a *= adj["attack_mult"]
                 lam_h /= adj["defense_mult"]
         return float(np.clip(lam_h, 0.32, 3.6)), float(np.clip(lam_a, 0.26, 3.2))
@@ -547,12 +562,12 @@ class LeagueModel:
         reasons_h: list[str] = []
         reasons_a: list[str] = []
         if apply_context:
-            home_disp = DISPLAY_NAME.get(home_csv, home_csv)
-            away_disp = DISPLAY_NAME.get(away_csv, away_csv)
-            if home_disp in TEAM_CONTEXT:
-                reasons_h = context_adjustment(home_disp)["reasons"]
-            if away_disp in TEAM_CONTEXT:
-                reasons_a = context_adjustment(away_disp)["reasons"]
+            home_disp = self.league.to_display(home_csv)
+            away_disp = self.league.to_display(away_csv)
+            if home_disp in self.league.team_context:
+                reasons_h = context_adjustment(home_disp, self.league)["reasons"]
+            if away_disp in self.league.team_context:
+                reasons_a = context_adjustment(away_disp, self.league)["reasons"]
 
         order = np.argsort(grid, axis=None)[::-1][:6]
         top_scores = []
@@ -617,25 +632,26 @@ class LeagueModel:
     ) -> dict:
         if not self._fitted:
             self.fit()
-        if home_display not in CSV_NAME or away_display not in CSV_NAME:
-            raise KeyError("Unknown club — pick two 2026/27 Premier League sides.")
+        if home_display not in self.league.csv_name or away_display not in self.league.csv_name:
+            raise KeyError(f"Unknown club — pick two {self.league.name} sides.")
         if home_display == away_display:
             raise ValueError("Home and away clubs must differ.")
-        home_csv = CSV_NAME[home_display]
-        away_csv = CSV_NAME[away_display]
+        home_csv = self.league.csv_name[home_display]
+        away_csv = self.league.csv_name[away_display]
         raw = self._predict_from_states(home_csv, away_csv, self._as_of(), apply_context=apply_context)
         raw["home_display"] = home_display
         raw["away_display"] = away_display
         raw["home_csv"] = home_csv
         raw["away_csv"] = away_csv
-        raw["home_context"] = TEAM_CONTEXT[home_display]
-        raw["away_context"] = TEAM_CONTEXT[away_display]
-        raw["home_position"] = LAST_SEASON_POSITION[home_display]
-        raw["away_position"] = LAST_SEASON_POSITION[away_display]
+        raw["home_context"] = self.league.team_context[home_display]
+        raw["away_context"] = self.league.team_context[away_display]
+        raw["home_position"] = self.league.last_season_position[home_display]
+        raw["away_position"] = self.league.last_season_position[away_display]
         raw["h2h"] = self._h2h_table(home_csv, away_csv)
         raw["form_home"] = self._form_summary(home_csv)
         raw["form_away"] = self._form_summary(away_csv)
         raw["apply_context"] = apply_context
+        raw["league_id"] = self.league.id
         return raw
 
     def _form_summary(self, csv_name: str) -> dict:
@@ -648,7 +664,7 @@ class LeagueModel:
                 "points": 0,
                 "gf": 0,
                 "ga": 0,
-                "sequence": "No recent Premier League matches",
+                "sequence": f"No recent {self.league.name} matches",
             }
         seq = [("W" if x[6] == 3 else "D" if x[6] == 1 else "L") for x in last]
         return {
@@ -665,8 +681,8 @@ class LeagueModel:
             rows.append(
                 {
                     "date": pd.Timestamp(date).strftime("%d %b %Y"),
-                    "home": DISPLAY_NAME.get(home, home),
-                    "away": DISPLAY_NAME.get(away, away),
+                    "home": self.league.to_display(home),
+                    "away": self.league.to_display(away),
                     "score": f"{hg}-{ag}",
                 }
             )
@@ -674,8 +690,8 @@ class LeagueModel:
             rows.append(
                 {
                     "date": pd.Timestamp(date).strftime("%d %b %Y"),
-                    "home": DISPLAY_NAME.get(away, away),
-                    "away": DISPLAY_NAME.get(home, home),
+                    "home": self.league.to_display(away),
+                    "away": self.league.to_display(home),
                     "score": f"{hg}-{ag}",
                 }
             )
@@ -738,19 +754,23 @@ class LeagueModel:
         return build_backtest_rows(self, season)
 
     def snapshot(self, display_name: str) -> dict:
-        csv_name = CSV_NAME[display_name]
+        csv_name = self.league.csv_name[display_name]
         st = self.states[csv_name]
-        ctx = TEAM_CONTEXT[display_name]
+        ctx = self.league.team_context[display_name]
         return {
             "elo": st.elo,
             "attack": st.attack,
             "defense": st.defense,
             "matches": st.matches,
-            "last_date": st.last_date.strftime("%d %b %Y") if st.last_date is not None else "No recent PL games",
+            "last_date": (
+                st.last_date.strftime("%d %b %Y")
+                if st.last_date is not None
+                else f"No recent {self.league.name} games"
+            ),
             "form": self._form_summary(csv_name),
             "manager": ctx["manager"],
-            "promoted": display_name in PROMOTED_TEAMS,
-            "position": LAST_SEASON_POSITION[display_name],
+            "promoted": display_name in self.league.promoted,
+            "position": self.league.last_season_position[display_name],
         }
 
 
@@ -764,6 +784,7 @@ def build_backtest_rows(model: LeagueModel, season: str = "2025/26") -> list[dic
         model.fit()
     blend_w = float(getattr(model, "blend_w", 0.72))
     temperature = float(getattr(model, "temperature", 1.0))
+    league = getattr(model, "league", get_league("epl"))
     rows = []
     for row in getattr(model, "backtest", []) or []:
         if season and row.get("season") != season:
@@ -789,13 +810,15 @@ def build_backtest_rows(model: LeagueModel, season: str = "2025/26") -> list[dic
         if date is not None:
             parsed_date = pd.Timestamp(date)
             month = parsed_date.strftime("%Y-%m")
+        home_d = league.to_display(home)
+        away_d = league.to_display(away)
         rows.append(
             {
                 "date": parsed_date,
                 "month": month,
-                "home": DISPLAY_NAME.get(home, home),
-                "away": DISPLAY_NAME.get(away, away),
-                "match": f"{DISPLAY_NAME.get(home, home)} vs {DISPLAY_NAME.get(away, away)}",
+                "home": home_d,
+                "away": away_d,
+                "match": f"{home_d} vs {away_d}",
                 "actual": row["actual"],
                 "predicted": pred,
                 "correct": pred == row["actual"],
@@ -820,48 +843,61 @@ def build_backtest_rows(model: LeagueModel, season: str = "2025/26") -> list[dic
 def _write_cache(model: LeagueModel) -> None:
     try:
         model.api_version = MODEL_API_VERSION
-        CACHE_PATH.write_bytes(pickle.dumps(model, protocol=pickle.HIGHEST_PROTOCOL))
+        path = model.league.cache_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(pickle.dumps(model, protocol=pickle.HIGHEST_PROTOCOL))
     except OSError:
         pass
 
 
-def clear_model_cache() -> None:
+def clear_model_cache(league: LeagueConfig | str | None = None) -> None:
     get_model.cache_clear()
-    try:
-        if CACHE_PATH.exists():
-            CACHE_PATH.unlink()
-    except OSError:
-        pass
+    targets: list[Path] = []
+    if league is None:
+        from epl_predictor.leagues import LEAGUES
+
+        targets = [cfg.cache_path for cfg in LEAGUES.values()]
+        legacy = Path(__file__).resolve().parent / "model_cache.pkl"
+        targets.append(legacy)
+    else:
+        if isinstance(league, str):
+            league = get_league(league)
+        targets = [league.cache_path]
+    for path in targets:
+        try:
+            if path.exists():
+                path.unlink()
+        except OSError:
+            pass
 
 
-@lru_cache(maxsize=8)
-def get_model(fingerprint: str = "") -> LeagueModel:
-    """Fit (or load) a model keyed by the training-data fingerprint.
-
-    Pass the current `results_fingerprint` so Streamlit / lru caches invalidate
-    when new live scores appear.
-    """
-    matches, meta = load_matches(include_live=True)
+@lru_cache(maxsize=9)
+def get_model(league_id: str = "epl", fingerprint: str = "") -> LeagueModel:
+    """Fit (or load) a model keyed by league id and training-data fingerprint."""
+    league = get_league(league_id)
+    matches, meta = load_matches(league, include_live=True)
     actual_fp = str(meta["fingerprint"])
-    # Prefer the live fingerprint; `fingerprint` is mainly a cache-key argument.
     _ = fingerprint or actual_fp
 
-    if CACHE_PATH.exists():
+    cache_path = league.cache_path
+    if cache_path.exists():
         try:
-            model = pickle.loads(CACHE_PATH.read_bytes())
+            model = pickle.loads(cache_path.read_bytes())
             version_ok = getattr(model, "api_version", 0) == MODEL_API_VERSION
             schema_ok = bool(getattr(model, "backtest", None)) and "home" in model.backtest[0]
             fitted_ok = getattr(model, "_fitted", False)
             cache_fp = str(getattr(model, "results_fingerprint", ""))
             fp_ok = cache_fp == actual_fp
-            if fitted_ok and version_ok and schema_ok and fp_ok:
+            league_ok = getattr(getattr(model, "league", None), "id", None) == league.id
+            if fitted_ok and version_ok and schema_ok and fp_ok and league_ok:
+                model.league = league
                 model.training_meta = meta
-                model.as_of = compute_as_of(matches)
+                model.as_of = compute_as_of(matches, league)
                 return model
         except (OSError, pickle.UnpicklingError, AttributeError, TypeError, IndexError, KeyError):
             pass
 
-    model = LeagueModel(matches, meta=meta)
+    model = LeagueModel(matches, league=league, meta=meta)
     model.fit()
     model.api_version = MODEL_API_VERSION
     model.results_fingerprint = actual_fp
