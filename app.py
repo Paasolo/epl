@@ -116,7 +116,17 @@ def active_league():
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def cached_results_fingerprint(league_id: str) -> str:
-    return current_results_fingerprint(league_id, include_live=True)
+    try:
+        return current_results_fingerprint(league_id, include_live=True)
+    except Exception as exc:  # noqa: BLE001 — show a Cloud-safe message
+        # Fall back to a history-only fingerprint so the UI can still boot.
+        try:
+            return current_results_fingerprint(league_id, include_live=False)
+        except Exception:
+            raise RuntimeError(
+                f"Failed to load {league_id} training data ({type(exc).__name__}). "
+                "Try Refresh results, or check that historical CSVs are available."
+            ) from None
 
 
 @st.cache_resource(show_spinner="Loading calibrated league ratings…")

@@ -237,10 +237,9 @@ def _fetch_fixturedownload(
                 hg_i, ag_i = int(hg), int(ag)
             except (TypeError, ValueError):
                 continue
-            date = pd.to_datetime(match.get("DateUtc"), utc=True, errors="coerce")
-            if pd.isna(date):
+            date = _to_naive_timestamp(match.get("DateUtc"))
+            if date is None:
                 continue
-            date = date.tz_convert(None).normalize()
             rows.append(
                 {
                     "Season": season,
@@ -307,18 +306,34 @@ def fetch_season_results(
 
 def _parse_match_dates(series: pd.Series) -> pd.Series:
     """Parse football-data dates (dd/mm/yy) and ISO dates from our cached CSVs."""
-    as_str = series.astype(str)
-    iso_mask = as_str.str.match(r"^\d{4}-\d{2}-\d{2}", na=False)
-    parsed = pd.Series(pd.NaT, index=series.index, dtype="datetime64[ns]")
-    if iso_mask.any():
-        parsed.loc[iso_mask] = pd.to_datetime(series.loc[iso_mask], errors="coerce")
-    rest = ~iso_mask & series.notna()
-    if rest.any():
-        parsed.loc[rest] = pd.to_datetime(series.loc[rest], dayfirst=True, errors="coerce")
-        still_missing = rest & parsed.isna()
-        if still_missing.any():
-            parsed.loc[still_missing] = pd.to_datetime(series.loc[still_missing], errors="coerce")
-    return parsed
+    if series is None or len(series) == 0:
+        return pd.Series(dtype="datetime64[ns]")
+    if pd.api.types.is_datetime64_any_dtype(series):
+        return pd.to_datetime(series, errors="coerce")
+
+    # Prefer unambiguous ISO; fall back to day-first football-data style.
+    iso = pd.to_datetime(series, format="%Y-%m-%d", errors="coerce")
+    dayfirst = pd.to_datetime(series, dayfirst=True, errors="coerce")
+    parsed = iso.fillna(dayfirst)
+    # Last resort for mixed Timestamp/object frames after concat.
+    still = parsed.isna() & series.notna()
+    if still.any():
+        parsed = parsed.copy()
+        parsed.loc[still] = pd.to_datetime(series.loc[still], errors="coerce")
+    return pd.to_datetime(parsed, errors="coerce")
+
+
+def _to_naive_timestamp(value) -> pd.Timestamp | None:
+    """Normalize fixturedownload / CSV datetimes to timezone-naive midnight."""
+    ts = pd.to_datetime(value, utc=True, errors="coerce")
+    if pd.isna(ts):
+        ts = pd.to_datetime(value, errors="coerce")
+    if pd.isna(ts):
+        return None
+    ts = pd.Timestamp(ts)
+    if ts.tzinfo is not None:
+        ts = ts.tz_convert("UTC").tz_localize(None)
+    return ts.normalize()
 
 
 def merge_history_and_live(base_df: pd.DataFrame, live_df: pd.DataFrame) -> pd.DataFrame:

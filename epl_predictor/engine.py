@@ -134,6 +134,7 @@ def load_matches(
     """Load historical CSV, optionally merge live 2026/27 results, and clean.
 
     Returns (matches, meta) where meta includes fingerprint and live fetch status.
+    Live-fetch failures fall back to history-only so Cloud deploys stay up.
     """
     if isinstance(league, str):
         league = get_league(league)
@@ -147,7 +148,17 @@ def load_matches(
     }
     live = pd.DataFrame()
     if include_live:
-        live, live_status = fetch_season_results(league, LIVE_SEASON)
+        try:
+            live, live_status = fetch_season_results(league, LIVE_SEASON)
+        except Exception as exc:  # noqa: BLE001 — keep the app booting on Cloud
+            live = pd.DataFrame()
+            live_status = {
+                "ok": False,
+                "n_live": 0,
+                "message": f"Live fetch failed ({type(exc).__name__}); using historical CSV only.",
+                "season": LIVE_SEASON,
+                "soft": True,
+            }
     merged = merge_history_and_live(base, live)
     cleaned = _clean_matches(merged)
     meta = training_meta(cleaned, live_status=live_status)
@@ -160,8 +171,15 @@ def current_results_fingerprint(
     include_live: bool = True,
 ) -> str:
     """Fingerprint of the training frame used for Streamlit / lru cache keys."""
-    _matches, meta = load_matches(league, include_live=include_live)
-    return str(meta["fingerprint"])
+    try:
+        _matches, meta = load_matches(league, include_live=include_live)
+        return str(meta["fingerprint"])
+    except Exception as exc:  # noqa: BLE001
+        lid = league if isinstance(league, str) else getattr(league, "id", "unknown")
+        # Safe message only — Streamlit Cloud redacts exceptions that embed data.
+        raise RuntimeError(
+            f"Could not fingerprint training data for league '{lid}' ({type(exc).__name__})."
+        ) from None
 
 
 def _xg_proxy(goals: pd.Series, sot: pd.Series, shots: pd.Series) -> np.ndarray:
