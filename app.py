@@ -9,6 +9,8 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
+from epl_predictor.auth import current_user, ensure_default_admin, sign_out
+from epl_predictor.auth_ui import render_auth_gate
 from epl_predictor.engine import (
     MODEL_API_VERSION,
     build_backtest_rows,
@@ -17,8 +19,25 @@ from epl_predictor.engine import (
     get_model,
     ranked_picks,
 )
-from epl_predictor.fixtures import fixtures_for_unplayed, matchweek_options, validate_matchweeks
+from epl_predictor.fixtures import (
+    fixtures_for_unplayed,
+    matchweek_options,
+    next_unplayed_matchweek,
+    validate_matchweeks,
+)
 from epl_predictor.leagues import LEAGUE_ORDER, LEAGUES, get_league, league_options
+from epl_predictor.payments import (
+    WEEKLY_PRICE_LABEL,
+    consume_paystack_flash,
+    current_unlock_week,
+    expand_cross_league_unlock,
+    handle_paystack_return,
+    has_week_access,
+    load_payment_rows,
+    payment_summary,
+    paystack_configured,
+    render_paywall,
+)
 from epl_predictor.results import LIVE_SEASON
 
 st.set_page_config(
@@ -232,13 +251,18 @@ def refresh_training_data(league_id: str | None = None) -> None:
     clear_model_cache(lid)
     cached_results_fingerprint.clear()
     load_fitted_model.clear()
+    st.session_state.pop("gw_default_for_league", None)
 
 
-def reset_slate_state() -> None:
+def reset_slate_state(*, empty: bool = False) -> None:
     ids = list(st.session_state.get("match_ids", []))
     clear_match_widget_keys(ids)
-    st.session_state.match_ids = [0, 1]
-    st.session_state.next_match_id = 2
+    if empty:
+        st.session_state.match_ids = []
+        st.session_state.next_match_id = 0
+    else:
+        st.session_state.match_ids = [0, 1]
+        st.session_state.next_match_id = 2
     for key in (
         "last_predictions",
         "last_ranked_table",
@@ -250,6 +274,115 @@ def reset_slate_state() -> None:
         "mw_locked",
     ):
         st.session_state.pop(key, None)
+
+
+def customer_league_options() -> dict[str, str]:
+    """League picker for customers — Belgian Pro League is admin-only."""
+    return {label: lid for label, lid in league_options().items() if lid != "belgium"}
+
+
+def is_customer_user() -> bool:
+    user = current_user()
+    return bool(user and user.get("role") != "admin")
+
+
+def is_admin_user() -> bool:
+    user = current_user()
+    return bool(user and user.get("role") == "admin")
+
+
+def render_admin_payments_tab() -> None:
+    st.subheader("Payments")
+    st.caption(
+        f"Weekly unlocks are {WEEKLY_PRICE_LABEL} via Paystack. "
+        "This view combines Paystack transactions with the local verification ledger."
+    )
+    if not paystack_configured():
+        st.warning(
+            "Paystack is not configured. Add `[paystack]` keys to `.streamlit/secrets.toml` "
+            "to load live transaction history."
+        )
+
+    c1, c2 = st.columns([1, 3])
+    with c1:
+        refresh = st.button("Refresh payments", use_container_width=True, type="primary")
+    with c2:
+        pages = st.selectbox("Paystack pages to fetch", [1, 2, 3, 5], index=2, help="50 transactions per page")
+
+    if refresh:
+        st.session_state.pop("admin_payments_cache", None)
+
+    cache = st.session_state.get("admin_payments_cache")
+    if cache is None or refresh:
+        with st.spinner("Loading payment data…"):
+            rows, note = load_payment_rows(prefer_paystack=True, pages=int(pages))
+        st.session_state["admin_payments_cache"] = {"rows": rows, "note": note}
+    else:
+        rows = cache.get("rows") or []
+        note = cache.get("note") or ""
+
+    summary = payment_summary(rows)
+    st.caption(f"Source: {note}")
+
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("Successful payments", summary["successful"])
+    m2.metric("Revenue (GHS)", f"{summary['revenue_ghs']:.2f}")
+    m3.metric("Unique customers", summary["unique_customers"])
+    m4.metric("All transactions", summary["total_transactions"])
+    m5.metric("Failed / other", summary["failed_or_other"])
+
+    by_week = summary.get("by_matchweek") or {}
+    if by_week:
+        st.markdown("**Successful payments by matchweek**")
+        week_df = pd.DataFrame(
+            [{"Matchweek": k, "Successful payments": v} for k, v in by_week.items()]
+        )
+        st.dataframe(week_df, hide_index=True, use_container_width=True)
+
+    st.markdown("**All payment records**")
+    if not rows:
+        st.info("No payments found yet.")
+        return
+
+    status_filter = st.multiselect(
+        "Filter by status",
+        sorted({str(r.get("status") or "unknown") for r in rows}),
+        default=["success"] if any(str(r.get("status")) == "success" for r in rows) else None,
+    )
+    filtered = rows
+    if status_filter:
+        filtered = [r for r in rows if str(r.get("status") or "unknown") in status_filter]
+
+    table = pd.DataFrame(filtered)
+    display_cols = [
+        c
+        for c in (
+            "paid_at",
+            "email",
+            "status",
+            "amount_ghs",
+            "currency",
+            "matchweek",
+            "season",
+            "reference",
+            "channel",
+            "gateway_response",
+            "source",
+        )
+        if c in table.columns
+    ]
+    st.dataframe(table[display_cols] if display_cols else table, hide_index=True, use_container_width=True)
+
+    csv_buf = StringIO()
+    (table[display_cols] if display_cols else table).to_csv(csv_buf, index=False)
+    st.download_button(
+        "Download payments (CSV)",
+        data=csv_buf.getvalue(),
+        file_name="payments_export.csv",
+        mime="text/csv",
+        use_container_width=True,
+        key="dl_admin_payments_csv",
+    )
 
 
 def team_label(name: str, league) -> str:
@@ -343,6 +476,7 @@ def unlock_matchweek_slate() -> None:
     st.session_state.pop("mw_loaded", None)
     st.session_state.pop("mw_excluded", None)
     st.session_state.pop("mw_complete", None)
+    st.session_state.pop("gw_default_for_league", None)
 
 
 def ranked_table_rows(ranked: list[dict]) -> list[dict]:
@@ -528,14 +662,37 @@ def render_prediction(pred: dict, easiest: bool, league, rank: int | None = None
 
 
 def render_sidebar(model, league) -> None:
-    options = league_options()
+    user = current_user()
+    if user and user.get("email"):
+        role_label = "Admin" if user.get("role") == "admin" else "Customer"
+        st.caption(f"Signed in as **{user['email']}** · {role_label}")
+        unlock_week = current_unlock_week(league, model)
+        if user.get("role") == "admin":
+            st.caption("Admin — prediction results unlocked")
+        elif unlock_week is not None and has_week_access(user, unlock_week):
+            st.caption(f"Matchweek {unlock_week} unlocked")
+        elif unlock_week is not None:
+            st.caption(f"Matchweek {unlock_week} locked · {WEEKLY_PRICE_LABEL}")
+        if st.button("Log out", use_container_width=True):
+            sign_out()
+            st.rerun()
+        st.divider()
+
+    options = customer_league_options() if is_customer_user() else league_options()
     labels = list(options.keys())
+    # Customers cannot stay on Belgian Pro League if it was selected earlier.
+    if is_customer_user() and st.session_state.get("league_id") == "belgium":
+        st.session_state.league_id = "epl"
+        reset_slate_state(empty=True)
+        st.session_state.pop("gw_default_for_league", None)
+        st.rerun()
     current_label = next((k for k, v in options.items() if v == league.id), labels[0])
     chosen = st.selectbox("League", labels, index=labels.index(current_label), key="league_select")
     new_id = options[chosen]
     if new_id != st.session_state.get("league_id", "epl"):
         st.session_state.league_id = new_id
-        reset_slate_state()
+        reset_slate_state(empty=is_customer_user())
+        st.session_state.pop("gw_default_for_league", None)
         st.rerun()
 
     bt = model.backtest_summary()
@@ -771,17 +928,38 @@ def render_predict_tab(model, league) -> None:
     labels = {t: team_label(t, league) for t in teams}
     defaults = default_fixtures(league)
     mw_locked = bool(st.session_state.get("mw_locked"))
+    is_customer = is_customer_user()
 
     if "match_ids" not in st.session_state:
-        st.session_state.match_ids = [0, 1]
-        st.session_state.next_match_id = 2
+        # Customers start with an empty slate until they click Load matchweek.
+        if is_customer:
+            st.session_state.match_ids = []
+            st.session_state.next_match_id = 0
+        else:
+            st.session_state.match_ids = [0, 1]
+            st.session_state.next_match_id = 2
+    elif is_customer and not mw_locked and not st.session_state.get("mw_loaded"):
+        # Never keep placeholder pairs for customers before Load matchweek.
+        if st.session_state.match_ids:
+            clear_match_widget_keys(list(st.session_state.match_ids))
+            st.session_state.match_ids = []
+            st.session_state.next_match_id = 0
 
     st.subheader("Select matches")
     if mw_locked:
         gw = st.session_state.get("mw_loaded")
         st.caption(
             f"Official matchweek {gw} is loaded and locked. "
-            "Selections cannot be changed until you unlock to a custom slate."
+            + (
+                "Switch leagues, then click Load matchweek to load that league’s fixtures."
+                if is_customer
+                else "Selections cannot be changed until you unlock to a custom slate."
+            )
+        )
+    elif is_customer:
+        st.caption(
+            "Choose a league, then click **Load matchweek** to load the current "
+            "official fixtures. Matches are not pre-loaded when you switch leagues."
         )
     else:
         st.caption(
@@ -798,10 +976,60 @@ def render_predict_tab(model, league) -> None:
     )
 
     gw_labels = matchweek_options(league)
+    gw_label_list = list(gw_labels.keys())
+    default_gw = next_unplayed_matchweek(model.matches, league, season=LIVE_SEASON)
+    default_gw_label = None
+    if default_gw is not None:
+        default_gw_label = next(
+            (label for label, num in gw_labels.items() if num == default_gw),
+            None,
+        )
+    user = current_user()
+    # is_customer already set at top of render_predict_tab
+    # Customers may only use the current (next unplayed) matchweek — no future weeks.
+    if is_customer and default_gw_label:
+        gw_label_list = [default_gw_label]
+        gw_labels = {default_gw_label: default_gw} if default_gw is not None else gw_labels
+
+    gw_select_key = f"gw_select_{league.id}"
+    # Point the dropdown at the next unplayed week when unlocked / on league switch.
+    if (
+        gw_labels
+        and default_gw_label
+        and not mw_locked
+        and (
+            st.session_state.get("gw_default_for_league") != league.id
+            or (is_customer and st.session_state.get(gw_select_key) != default_gw_label)
+        )
+    ):
+        st.session_state[gw_select_key] = default_gw_label
+        st.session_state["gw_default_for_league"] = league.id
+
     load_c1, load_c2, load_c3 = st.columns([2.4, 1.2, 1.2])
     with load_c1:
-        if gw_labels:
-            gw_label = st.selectbox("Official matchweek", list(gw_labels.keys()), key=f"gw_select_{league.id}")
+        if gw_labels and gw_label_list:
+            default_index = (
+                gw_label_list.index(default_gw_label)
+                if default_gw_label in gw_label_list
+                else 0
+            )
+            help_txt = (
+                f"Customers can only load the current matchweek"
+                + (f" ({default_gw_label})." if default_gw_label else ".")
+                if is_customer
+                else (
+                    "Defaults to the next matchweek with unplayed fixtures"
+                    + (f" (currently {default_gw_label})." if default_gw_label else ".")
+                )
+            )
+            gw_label = st.selectbox(
+                "Official matchweek",
+                gw_label_list,
+                index=default_index,
+                key=gw_select_key,
+                disabled=is_customer and len(gw_label_list) <= 1,
+                help=help_txt,
+            )
         else:
             gw_label = None
             st.selectbox(
@@ -816,21 +1044,31 @@ def render_predict_tab(model, league) -> None:
             "Load matchweek",
             use_container_width=True,
             type="secondary",
-            disabled=not gw_labels,
+            disabled=not gw_labels or not gw_label,
         ):
-            load_matchweek_into_state(gw_labels[gw_label], model, league)
-            st.rerun()
+            selected_gw = gw_labels[gw_label]
+            if is_customer and default_gw is not None and selected_gw != default_gw:
+                st.error("Customers can only load the current matchweek.")
+            else:
+                load_matchweek_into_state(selected_gw, model, league)
+                st.rerun()
     with load_c3:
         st.markdown("<div style='height: 1.7rem'></div>", unsafe_allow_html=True)
         if mw_locked:
-            if st.button("Unlock custom slate", use_container_width=True):
+            if st.button(
+                "Unlock custom slate",
+                use_container_width=True,
+                disabled=is_customer,
+                help="Customers stay on the official current matchweek." if is_customer else None,
+            ):
                 unlock_matchweek_slate()
                 st.rerun()
         else:
             if st.button(
                 "Add match",
-                disabled=len(st.session_state.match_ids) >= MAX_MATCHES,
+                disabled=is_customer or len(st.session_state.match_ids) >= MAX_MATCHES,
                 use_container_width=True,
+                help="Customers use the official current matchweek only." if is_customer else None,
             ):
                 st.session_state.match_ids.append(st.session_state.next_match_id)
                 st.session_state.next_match_id += 1
@@ -979,6 +1217,20 @@ def render_predict_tab(model, league) -> None:
         st.info("Fixtures or overlay setting changed since the last prediction. Click Predict again to refresh.")
         return
 
+    user = current_user()
+    unlock_week = current_unlock_week(league, model)
+    if not has_week_access(user, unlock_week):
+        st.subheader("Prediction results locked")
+        if unlock_week is None:
+            st.warning(
+                "Load an official matchweek (or wait until fixtures are available) "
+                "so we know which week to unlock."
+            )
+            return
+        email = (user or {}).get("email") or ""
+        render_paywall(unlock_week, email)
+        return
+
     easiest = ranked[0]
     if len(ranked) == 1:
         banner_extra = ""
@@ -1057,6 +1309,19 @@ def render_predict_tab(model, league) -> None:
 
 
 def main() -> None:
+    ensure_default_admin()
+    if not render_auth_gate():
+        st.stop()
+
+    handle_paystack_return()
+    flash = consume_paystack_flash()
+    if flash:
+        if flash.get("ok"):
+            st.success(flash.get("message") or "Payment successful.")
+        else:
+            st.error(flash.get("message") or "Payment could not be verified.")
+    expand_cross_league_unlock()
+
     if "league_id" not in st.session_state:
         st.session_state.league_id = "epl"
 
@@ -1097,15 +1362,25 @@ def main() -> None:
             fingerprint=fingerprint,
         )
 
-    tab_predict, tab_teams, tab_backtest = st.tabs(
-        ["Predict matches", "Team strength", "Backtest explorer"]
-    )
+    if is_admin_user():
+        tab_predict, tab_teams, tab_backtest, tab_admin = st.tabs(
+            ["Predict matches", "Team strength", "Backtest explorer", "Admin · Payments"]
+        )
+    else:
+        tab_predict, tab_teams, tab_backtest = st.tabs(
+            ["Predict matches", "Team strength", "Backtest explorer"]
+        )
+        tab_admin = None
+
     with tab_predict:
         render_predict_tab(model, league)
     with tab_teams:
         render_team_board(model, league)
     with tab_backtest:
         render_backtest_tab(model, league)
+    if tab_admin is not None:
+        with tab_admin:
+            render_admin_payments_tab()
 
 
 if __name__ == "__main__":

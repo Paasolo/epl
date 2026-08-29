@@ -15,6 +15,34 @@ py -m pip install -r requirements.txt
 py -m streamlit run app.py
 ```
 
+### Authentication (required)
+
+The app is gated behind **Supabase** email/password accounts. Create a free project at [supabase.com](https://supabase.com), enable **Authentication → Email**, then add secrets locally in `.streamlit/secrets.toml` (gitignored) or in Streamlit Cloud **App settings → Secrets**:
+
+```toml
+[supabase]
+url = "https://YOUR_PROJECT.supabase.co"
+key = "YOUR_ANON_KEY"
+```
+
+Use the Project URL and the **anon public** key (Settings → API). Without these secrets the login screen shows setup instructions and the predictor stays locked.
+
+If email confirmation is enabled in Supabase, new users must confirm their inbox before signing in; if it is disabled, sign-up signs them in immediately.
+
+### Paystack weekly unlock (Customers)
+
+**Customer** accounts must pay **GHS 50** per official matchweek (via [Paystack](https://paystack.com)) before ranked prediction results, cards, and downloads are shown. One payment unlocks that matchweek across **all leagues**. **Admin** accounts skip payment.
+
+Add Paystack keys (test or live) to `.streamlit/secrets.toml` or Streamlit Cloud secrets. Enable **GHS** in your Paystack dashboard:
+
+```toml
+[paystack]
+public_key = "pk_test_..."
+secret_key = "sk_test_..."
+```
+
+Optional: set `APP_URL = "https://your-app.streamlit.app"` so Paystack can redirect back after checkout when the auto-detected URL is wrong.
+
 The app opens in your browser with a **League** switcher in the sidebar and three tabs:
 
 - **Predict matches** — load any official matchweek (or add/remove fixtures by hand). Finished games are excluded automatically when you load a matchweek. Toggle the summer overlay on/off, then click **Predict**. Download the ranked slate as CSV or JSON.

@@ -7,7 +7,6 @@ from functools import lru_cache
 
 from epl_predictor.leagues.base import LeagueConfig
 from epl_predictor.leagues.epl import CONFIG as EPL_CONFIG
-from epl_predictor.results import _http_get
 
 
 def matchweek_options(league: LeagueConfig | None = None) -> dict[str, int]:
@@ -36,6 +35,29 @@ def fixtures_for_unplayed(
 
     league = league or EPL_CONFIG
     return split_matchweek_fixtures(gw, matches, league, season=season)
+
+
+def next_unplayed_matchweek(
+    matches,
+    league: LeagueConfig | None = None,
+    season: str = "2026/27",
+) -> int | None:
+    """Smallest official matchweek that still has at least one unplayed fixture.
+
+    If every scheduled week is fully played, returns the last matchweek so the
+    UI still has a sensible default. Returns None when no fixture feed exists.
+    """
+    league = league or EPL_CONFIG
+    weeks = matchweeks_for(league)
+    if not weeks:
+        return None
+    last_gw: int | None = None
+    for gw in sorted(weeks):
+        last_gw = gw
+        remaining, _excluded = fixtures_for_unplayed(gw, matches, league, season=season)
+        if remaining:
+            return gw
+    return last_gw
 
 
 def validate_matchweeks(league: LeagueConfig | None = None) -> list[str]:
@@ -70,6 +92,8 @@ def _cached_matchweeks(league_id: str, slug: str | None) -> dict[int, dict]:
     league = get_league(league_id)
     if not slug:
         return {}
+    from epl_predictor.results import _http_get
+
     url = f"https://fixturedownload.com/feed/json/{slug}"
     try:
         raw = _http_get(url, timeout=20.0)
