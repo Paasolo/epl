@@ -10,6 +10,7 @@ from epl_predictor.auth import (
     sign_in,
     sign_up,
 )
+from epl_predictor.ads import inject_adsense_site_script
 
 MIN_PASSWORD_LEN = 6
 
@@ -362,6 +363,8 @@ def render_auth_gate() -> bool:
     if is_authenticated():
         return True
 
+    # Public page: AdSense site script must be crawlable for Google approval.
+    inject_adsense_site_script()
     _inject_auth_styles()
 
     if not auth_configured():

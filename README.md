@@ -43,6 +43,24 @@ secret_key = "sk_test_..."
 
 Optional: set `APP_URL = "https://your-app.streamlit.app"` so Paystack can redirect back after checkout when the auto-detected URL is wrong.
 
+### Google AdSense (Customers · Predict tab)
+
+Customer accounts see AdSense display units on the **Predict matches** tab (above and below prediction results / the paywall). Admins do not see ads.
+
+1. Create a [Google AdSense](https://www.google.com/adsense/) account and add your Streamlit Cloud site URL.
+2. When AdSense asks you to paste the site script into `<head>`, you only need to set `client_id` — the app injects that script on the public sign-in page (Streamlit has no editable HTML `<head>`).
+3. Create two **Display** ad units (top and bottom banners) and set their slot IDs.
+4. Add secrets:
+
+```toml
+[adsense]
+client_id = "ca-pub-xxxxxxxxxxxxxxxx"
+slot_top = "##########"
+slot_bottom = "##########"
+```
+
+Ads may not fill on `localhost`, and Google must approve the site before inventory serves in production. Display slots are skipped until `slot_top` / `slot_bottom` are real IDs.
+
 The app opens in your browser with a **League** switcher in the sidebar and three tabs:
 
 - **Predict matches** — load any official matchweek (or add/remove fixtures by hand). Finished games are excluded automatically when you load a matchweek. Toggle the summer overlay on/off, then click **Predict**. Download the ranked slate as CSV or JSON.

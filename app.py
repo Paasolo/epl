@@ -9,6 +9,11 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
+from epl_predictor.ads import (
+    inject_adsense_site_script,
+    render_predict_bottom_ad,
+    render_predict_top_ad,
+)
 from epl_predictor.auth import current_user, ensure_default_admin, sign_out
 from epl_predictor.auth_ui import render_auth_gate
 from epl_predictor.engine import (
@@ -1218,6 +1223,9 @@ def render_predict_tab(model, league) -> None:
         return
 
     user = current_user()
+    if is_customer:
+        render_predict_top_ad()
+
     unlock_week = current_unlock_week(league, model)
     if not has_week_access(user, unlock_week):
         st.subheader("Prediction results locked")
@@ -1226,9 +1234,13 @@ def render_predict_tab(model, league) -> None:
                 "Load an official matchweek (or wait until fixtures are available) "
                 "so we know which week to unlock."
             )
+            if is_customer:
+                render_predict_bottom_ad()
             return
         email = (user or {}).get("email") or ""
         render_paywall(unlock_week, email)
+        if is_customer:
+            render_predict_bottom_ad()
         return
 
     easiest = ranked[0]
@@ -1307,9 +1319,13 @@ def render_predict_tab(model, league) -> None:
             rank=rank_by_id.get(id(pred)),
         )
 
+    if is_customer:
+        render_predict_bottom_ad()
+
 
 def main() -> None:
     ensure_default_admin()
+    inject_adsense_site_script()
     if not render_auth_gate():
         st.stop()
 
