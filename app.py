@@ -25,6 +25,8 @@ from epl_predictor.engine import (
     ranked_picks,
 )
 from epl_predictor.fixtures import (
+    clear_fixture_cache,
+    fixture_load_error,
     fixtures_for_unplayed,
     matchweek_options,
     next_unplayed_matchweek,
@@ -1037,25 +1039,42 @@ def render_predict_tab(model, league) -> None:
             )
         else:
             gw_label = None
+            feed_err = fixture_load_error(league)
+            empty_label = (
+                "Fixture feed temporarily unavailable — Retry"
+                if (feed_err or league.fixture_feed_slug)
+                else "No fixture feed — use custom slate"
+            )
             st.selectbox(
                 "Official matchweek",
-                ["No fixture feed — use custom slate"],
+                [empty_label],
                 disabled=True,
                 key=f"gw_select_{league.id}_empty",
             )
+            if feed_err:
+                st.caption(f"Could not load fixtures: {feed_err}")
     with load_c2:
         st.markdown("<div style='height: 1.7rem'></div>", unsafe_allow_html=True)
-        if st.button(
-            "Load matchweek",
-            use_container_width=True,
-            type="secondary",
-            disabled=not gw_labels or not gw_label,
-        ):
-            selected_gw = gw_labels[gw_label]
-            if is_customer and default_gw is not None and selected_gw != default_gw:
-                st.error("Customers can only load the current matchweek.")
-            else:
-                load_matchweek_into_state(selected_gw, model, league)
+        if gw_labels and gw_label:
+            if st.button(
+                "Load matchweek",
+                use_container_width=True,
+                type="secondary",
+            ):
+                selected_gw = gw_labels[gw_label]
+                if is_customer and default_gw is not None and selected_gw != default_gw:
+                    st.error("Customers can only load the current matchweek.")
+                else:
+                    load_matchweek_into_state(selected_gw, model, league)
+                    st.rerun()
+        else:
+            if st.button(
+                "Retry fixtures",
+                use_container_width=True,
+                type="secondary",
+                help="Clear the fixture cache and fetch the official matchweek list again.",
+            ):
+                clear_fixture_cache(league.id)
                 st.rerun()
     with load_c3:
         st.markdown("<div style='height: 1.7rem'></div>", unsafe_allow_html=True)
@@ -1349,8 +1368,10 @@ def main() -> None:
         fingerprint=fingerprint,
     )
     mw_problems = validate_matchweeks(league)
-    if mw_problems and league.fixture_feed_slug:
-        st.warning("Fixture slate issue: " + "; ".join(mw_problems[:3]))
+    # Skip the expected "no feed" notice for leagues without a configured source (e.g. Belgium).
+    actionable = [p for p in mw_problems if not p.startswith("No fixture feed configured")]
+    if actionable:
+        st.warning("Fixture slate issue: " + "; ".join(actionable[:3]))
 
     st.markdown(
         f"""

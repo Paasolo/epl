@@ -129,19 +129,19 @@ def current_unlock_week(league, model) -> int | None:
 
 
 def all_leagues_current_weeks(season: str = LIVE_SEASON) -> set[int]:
-    """Next unplayed matchweek number for every league that has a fixture slate."""
-    from epl_predictor.engine import current_results_fingerprint, get_model
+    """Next unplayed matchweek number for every league that has a fixture slate.
+
+    Uses the fixture/openfootball feed only (no model fit / history reload) so
+    payment unlock stays fast on first expand.
+    """
+    from epl_predictor.fixtures import next_unplayed_matchweek_fast
     from epl_predictor.leagues import LEAGUES
 
+    _ = season  # season is encoded in the live fixture feeds
     weeks: set[int] = set()
-    for league_id, league in LEAGUES.items():
+    for _league_id, league in LEAGUES.items():
         try:
-            try:
-                fp = current_results_fingerprint(league_id, include_live=True)
-            except Exception:  # noqa: BLE001
-                fp = current_results_fingerprint(league_id, include_live=False)
-            model = get_model(league_id, fp)
-            gw = next_unplayed_matchweek(model.matches, league, season=season)
+            gw = next_unplayed_matchweek_fast(league)
             if gw is not None:
                 weeks.add(int(gw))
         except Exception:  # noqa: BLE001 — skip leagues that fail to load

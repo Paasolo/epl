@@ -203,6 +203,100 @@ def _fetch_football_data(
     return pd.DataFrame(columns=SCHEMA_COLS), status
 
 
+# openfootball season/file candidates (same as fixtures — GitHub raw, fast).
+_OPENFOOTBALL_FILES: dict[str, list[tuple[str, str]]] = {
+    "epl": [("2026-27", "en.1.json"), ("2025-26", "en.1.json")],
+    "laliga": [("2026-27", "es.1.json"), ("2025-26", "es.1.json")],
+    "bundesliga": [("2026-27", "de.1.json"), ("2025-26", "de.1.json")],
+    "ligue1": [("2026-27", "fr.1.json"), ("2025-26", "fr.1.json")],
+    "seriea": [("2026-27", "it.1.json"), ("2025-26", "it.1.json")],
+    "eredivisie": [("2026-27", "nl.1.json"), ("2025-26", "nl.1.json")],
+    "portugal": [("2026-27", "pt.1.json"), ("2025-26", "pt.1.json")],
+}
+_OPENFOOTBALL_RAW = (
+    "https://raw.githubusercontent.com/openfootball/football.json/master/{season}/{file}"
+)
+
+
+def _fetch_openfootball_results(
+    league: LeagueConfig,
+    season: str,
+    timeout: float = 8.0,
+) -> tuple[pd.DataFrame, dict]:
+    """Completed scores from openfootball JSON (preferred over fixturedownload)."""
+    from epl_predictor.fixtures import resolve_feed_team
+
+    status = _empty_status(season, None)
+    candidates = _OPENFOOTBALL_FILES.get(league.id, [])
+    if not candidates:
+        status["message"] = f"No openfootball feed for {league.name}."
+        status["soft"] = True
+        return pd.DataFrame(columns=SCHEMA_COLS), status
+
+    errors: list[str] = []
+    for of_season, filename in candidates:
+        url = _OPENFOOTBALL_RAW.format(season=of_season, file=filename)
+        status["url"] = url
+        try:
+            raw = _http_get(url, timeout=timeout)
+            payload = json.loads(raw.decode("utf-8"))
+            matches = payload.get("matches") if isinstance(payload, dict) else None
+            if not isinstance(matches, list):
+                errors.append(f"{of_season}/{filename}: bad payload")
+                continue
+            rows = []
+            for match in matches:
+                score = match.get("score") or {}
+                ft = score.get("ft") if isinstance(score, dict) else None
+                if not isinstance(ft, (list, tuple)) or len(ft) < 2:
+                    continue
+                try:
+                    hg_i, ag_i = int(ft[0]), int(ft[1])
+                except (TypeError, ValueError):
+                    continue
+                home_d = resolve_feed_team(league, str(match.get("team1") or ""))
+                away_d = resolve_feed_team(league, str(match.get("team2") or ""))
+                if home_d is None or away_d is None:
+                    continue
+                date = _to_naive_timestamp(match.get("date"))
+                if date is None:
+                    continue
+                rows.append(
+                    {
+                        "Season": season,
+                        "MatchDate": date,
+                        "HomeTeam": league.csv_name.get(home_d, home_d),
+                        "AwayTeam": league.csv_name.get(away_d, away_d),
+                        "FullTimeHomeGoals": hg_i,
+                        "FullTimeAwayGoals": ag_i,
+                        "FullTimeResult": "H" if hg_i > ag_i else "A" if hg_i < ag_i else "D",
+                    }
+                )
+            live = pd.DataFrame(rows)
+            if live.empty:
+                live = pd.DataFrame(columns=SCHEMA_COLS)
+            else:
+                for col in SCHEMA_COLS:
+                    if col not in live.columns:
+                        live[col] = pd.NA
+                live = live[SCHEMA_COLS].reset_index(drop=True)
+            status["ok"] = True
+            status["source"] = "openfootball"
+            status["n_live"] = int(len(live))
+            status["message"] = (
+                f"Fetched {len(live)} completed {season} match(es) from openfootball."
+                if len(live)
+                else f"openfootball has no completed {season} scores yet."
+            )
+            status["soft"] = len(live) == 0
+            return live, status
+        except (HTTPError, URLError, TimeoutError, OSError, ValueError, json.JSONDecodeError) as exc:
+            errors.append(f"{of_season}/{filename}: {type(exc).__name__}: {exc}")
+
+    status["message"] = errors[0] if errors else "openfootball unavailable."
+    return pd.DataFrame(columns=SCHEMA_COLS), status
+
+
 def _fetch_fixturedownload(
     league: LeagueConfig,
     season: str,
@@ -277,27 +371,38 @@ def _fetch_fixturedownload(
 def fetch_season_results(
     league: LeagueConfig,
     season: str = LIVE_SEASON,
-    timeout: float = 20.0,
+    timeout: float = 12.0,
 ) -> tuple[pd.DataFrame, dict]:
     """Download completed matches for a season. On failure returns empty + status."""
-    live, status = _fetch_football_data(league, season, timeout=timeout)
+    live, status = _fetch_football_data(league, season, timeout=min(timeout, 12.0))
     if status.get("ok") and status.get("n_live", 0) > 0:
         return live, status
 
-    alt, alt_status = _fetch_fixturedownload(league, season, timeout=timeout)
-    if alt_status.get("ok"):
+    of_live, of_status = _fetch_openfootball_results(league, season, timeout=min(timeout, 8.0))
+    if of_status.get("ok") and of_status.get("n_live", 0) > 0:
+        return of_live, of_status
+
+    # Last resort — keep timeout short; this host often hangs.
+    alt, alt_status = _fetch_fixturedownload(league, season, timeout=min(4.0, timeout))
+    if alt_status.get("ok") and alt_status.get("n_live", 0) > 0:
         return alt, alt_status
 
-    combined = _empty_status(season, status.get("url"))
-    if status.get("soft") and not alt_status.get("ok"):
+    if status.get("ok"):
+        return live, status
+    if of_status.get("ok"):
+        return of_live, of_status
+
+    combined = _empty_status(season, status.get("url") or of_status.get("url"))
+    if status.get("soft") or of_status.get("soft"):
         combined["soft"] = True
         combined["message"] = (
-            f"Live {season} results are not published on football-data.co.uk yet "
-            f"({league.name} CSV still missing). Using historical CSV only until scores appear."
+            f"Live {season} results are not published yet for {league.name}. "
+            "Using historical CSV only until scores appear."
         )
     else:
         combined["message"] = (
             status.get("message")
+            or of_status.get("message")
             or alt_status.get("message")
             or "Could not fetch live results. Using historical CSV only."
         )
