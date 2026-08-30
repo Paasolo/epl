@@ -331,11 +331,12 @@ def _render_signup_form() -> None:
     )
     with st.form("signup_form", clear_on_submit=False):
         email = st.text_input("Email", key="signup_email", placeholder="you@email.com")
+        st.caption("We’ll use your phone to send a payment confirmation SMS.")
         phone = st.text_input(
-            "Phone number",
+            "Phone number *",
             key="signup_phone",
-            placeholder="+233 24 000 0000",
-            help="Required. Include country code when possible (e.g. +233…).",
+            placeholder="024 XXX XXXX or +233…",
+            help="Required. Used for Nalo SMS after you unlock a matchweek.",
         )
         password = st.text_input(
             "Password",
