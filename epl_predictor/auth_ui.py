@@ -6,9 +6,11 @@ import streamlit as st
 
 from epl_predictor.auth import (
     auth_configured,
+    default_admin_bootstrap_message,
     is_authenticated,
     sign_in,
     sign_up,
+    validate_phone,
 )
 from epl_predictor.ads import inject_adsense_site_script
 
@@ -212,10 +214,21 @@ def _inject_auth_styles() -> None:
     )
 
 
-def _validate_credentials(email: str, password: str, confirm: str | None = None) -> str | None:
+def _validate_credentials(
+    email: str,
+    password: str,
+    confirm: str | None = None,
+    *,
+    phone: str | None = None,
+    require_phone: bool = False,
+) -> str | None:
     email = (email or "").strip()
     if not email or "@" not in email or "." not in email.split("@")[-1]:
         return "Enter a valid email address."
+    if require_phone:
+        phone_err = validate_phone(phone)
+        if phone_err:
+            return phone_err
     if len(password or "") < MIN_PASSWORD_LEN:
         return f"Password must be at least {MIN_PASSWORD_LEN} characters."
     if confirm is not None and password != confirm:
@@ -318,6 +331,12 @@ def _render_signup_form() -> None:
     )
     with st.form("signup_form", clear_on_submit=False):
         email = st.text_input("Email", key="signup_email", placeholder="you@email.com")
+        phone = st.text_input(
+            "Phone number",
+            key="signup_phone",
+            placeholder="+233 24 000 0000",
+            help="Required. Include country code when possible (e.g. +233…).",
+        )
         password = st.text_input(
             "Password",
             type="password",
@@ -335,12 +354,14 @@ def _render_signup_form() -> None:
             "Create account", type="primary", use_container_width=True
         )
     if submitted:
-        err = _validate_credentials(email, password, confirm)
+        err = _validate_credentials(
+            email, password, confirm, phone=phone, require_phone=True
+        )
         if err:
             st.error(err)
         else:
             with st.spinner("Creating account…"):
-                result = sign_up(email, password)
+                result = sign_up(email, password, phone=phone)
             if result.ok:
                 if result.needs_confirmation:
                     st.success(result.message)
@@ -404,6 +425,9 @@ def render_auth_gate() -> bool:
         with st.container(border=True):
             mode = _render_mode_switch(st.session_state["auth_mode"])
             st.markdown("<div style='height:0.45rem'></div>", unsafe_allow_html=True)
+            boot_msg = default_admin_bootstrap_message()
+            if boot_msg:
+                st.warning(boot_msg)
             if mode == "signup":
                 _render_signup_form()
             else:

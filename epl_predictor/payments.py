@@ -169,6 +169,11 @@ def _persist_purchased_weeks(weeks: list[str], role: str = "customer") -> None:
                 "role": role,
                 "purchased_weeks": unique,
                 "cross_league_unlock": True,
+                **(
+                    {"phone": user.get("phone")}
+                    if user.get("phone")
+                    else {}
+                ),
             }
         }
     )
@@ -177,12 +182,18 @@ def _persist_purchased_weeks(weeks: list[str], role: str = "customer") -> None:
     uid = (getattr(updated, "id", None) if updated is not None else None) or user.get("id")
     meta = getattr(updated, "user_metadata", None) if updated is not None else {}
     purchased = meta.get("purchased_weeks") if isinstance(meta, dict) else unique
+    phone = None
+    if isinstance(meta, dict):
+        phone = str(meta.get("phone") or "").strip() or user.get("phone")
+    else:
+        phone = user.get("phone")
     st.session_state[USER_KEY] = {
         "email": email,
         "id": str(uid) if uid else None,
         "role": role,
         "purchased_weeks": list(purchased) if isinstance(purchased, list) else unique,
         "cross_league_unlock": True,
+        "phone": phone,
     }
     session = getattr(response, "session", None)
     if session is not None:
@@ -327,22 +338,30 @@ def initialize_payment(email: str, week: int, season: str = LIVE_SEASON) -> Paym
 
     reference = f"mw{week}-{uuid.uuid4().hex[:16]}"
     callback = _app_callback_url()
+    user = current_user() or {}
+    phone = str(user.get("phone") or "").strip()
+    meta = {
+        "season": season,
+        "matchweek": int(week),
+        "email": email,
+        "access_key": week_access_key(week, season),
+        "custom_fields": [
+            {"display_name": "Matchweek", "variable_name": "matchweek", "value": str(week)},
+            {"display_name": "Season", "variable_name": "season", "value": season},
+        ],
+    }
+    if phone:
+        meta["phone"] = phone
+        meta["custom_fields"].append(
+            {"display_name": "Phone", "variable_name": "phone", "value": phone}
+        )
     payload = {
         "email": email,
         "amount": WEEKLY_PRICE_PESEWAS,
         "currency": CURRENCY,
         "reference": reference,
         "callback_url": callback,
-        "metadata": {
-            "season": season,
-            "matchweek": int(week),
-            "email": email,
-            "access_key": week_access_key(week, season),
-            "custom_fields": [
-                {"display_name": "Matchweek", "variable_name": "matchweek", "value": str(week)},
-                {"display_name": "Season", "variable_name": "season", "value": season},
-            ],
-        },
+        "metadata": meta,
     }
     try:
         data = _paystack_request("POST", PAYSTACK_INIT_URL, payload)
@@ -429,10 +448,22 @@ def verify_and_grant(reference: str, expected_week: int | None = None) -> Paymen
     except Exception as exc:  # noqa: BLE001
         return PaymentResult(ok=False, message=f"Payment verified but unlock failed: {exc}")
 
+    phone = str(user.get("phone") or meta.get("phone") or "").strip() or None
+    already_recorded = False
+    try:
+        already_recorded = any(
+            str(r.get("reference") or "") == str(reference)
+            and str(r.get("status") or "").lower() == "success"
+            for r in _ledger_read()
+        )
+    except Exception:  # noqa: BLE001
+        already_recorded = False
+
     record_local_payment(
         {
             "reference": str(reference),
             "email": paid_email or (user.get("email") or ""),
+            "phone": phone or "",
             "amount_pesewas": amount_i,
             "amount_ghs": round(amount_i / 100, 2),
             "currency": currency,
@@ -446,11 +477,35 @@ def verify_and_grant(reference: str, expected_week: int | None = None) -> Paymen
         }
     )
 
+    sms_note = ""
+    sms_key = f"paystack_sms_{reference}"
+    if already_recorded or st.session_state.get(sms_key) == "sent":
+        pass
+    else:
+        try:
+            from epl_predictor.sms import notify_payment_success
+
+            sms = notify_payment_success(
+                phone,
+                week=int(week),
+                season=season or LIVE_SEASON,
+                amount_label=WEEKLY_PRICE_LABEL,
+            )
+            if sms.ok:
+                sms_note = " Confirmation SMS sent."
+                st.session_state[sms_key] = "sent"
+            elif not sms.skipped:
+                sms_note = " (SMS could not be sent — check Nalo settings.)"
+                st.session_state[sms_key] = sms.message
+        except Exception as exc:  # noqa: BLE001 — never block unlock on SMS
+            sms_note = " (SMS could not be sent.)"
+            st.session_state[sms_key] = str(exc)
+
     return PaymentResult(
         ok=True,
         message=(
             f"Matchweek {week} unlocked across all leagues "
-            f"(current slates included)."
+            f"(current slates included).{sms_note}"
         ),
         reference=reference,
         week=int(week),

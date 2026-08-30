@@ -14,6 +14,7 @@ USER_KEY = "auth_user"
 
 DEFAULT_ADMIN_EMAIL = "paasolo3041@yahoo.com"
 DEFAULT_ADMIN_PASSWORD = "Melvin@2019"
+DEFAULT_ADMIN_PHONE = "0244445813"
 
 
 @dataclass(frozen=True)
@@ -70,6 +71,37 @@ def _client():
     return create_client(url, key)
 
 
+def _phone_from_user(user: Any) -> str | None:
+    meta = getattr(user, "user_metadata", None) or {}
+    if not isinstance(meta, dict):
+        return None
+    phone = str(meta.get("phone") or "").strip()
+    return phone or None
+
+
+def normalize_phone(raw: str | None) -> str:
+    """Strip common separators; keep a leading + for international format."""
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    keep_plus = text.startswith("+")
+    digits = "".join(ch for ch in text if ch.isdigit())
+    if not digits:
+        return ""
+    return f"+{digits}" if keep_plus else digits
+
+
+def validate_phone(raw: str | None) -> str | None:
+    """Return an error message, or None if the phone looks usable."""
+    phone = normalize_phone(raw)
+    if not phone:
+        return "Enter your phone number."
+    digits = "".join(ch for ch in phone if ch.isdigit())
+    if len(digits) < 7 or len(digits) > 15:
+        return "Enter a valid phone number (7–15 digits)."
+    return None
+
+
 def _purchased_weeks_from_user(user: Any) -> list[str]:
     meta = getattr(user, "user_metadata", None) or {}
     if not isinstance(meta, dict):
@@ -101,6 +133,7 @@ def _store_session(session: Any, user: Any) -> None:
             "role": _user_role(user, email),
             "purchased_weeks": _purchased_weeks_from_user(user),
             "cross_league_unlock": cross,
+            "phone": _phone_from_user(user),
         }
 
 
@@ -130,74 +163,219 @@ def default_admin_credentials() -> tuple[str, str]:
 
 def ensure_default_admin() -> str:
     """Create the default admin once if missing — avoid burning email rate limits."""
-    return _ensure_default_admin_cached()
+    status = _bootstrap_default_admin()
+    st.session_state["default_admin_status"] = status
+    return status
 
 
 def _admin_marker_path() -> Path:
     return Path(__file__).resolve().parent / "cache" / "default_admin_ready.flag"
 
 
-@st.cache_resource
-def _ensure_default_admin_cached() -> str:
+def _admin_phone_marker_path() -> Path:
+    return Path(__file__).resolve().parent / "cache" / "default_admin_phone.flag"
+
+
+def _admin_phone_value() -> str:
+    phone = DEFAULT_ADMIN_PHONE
+    try:
+        block = st.secrets.get("supabase") or {}
+        phone = str(block.get("default_admin_phone") or phone).strip() or phone
+    except Exception:  # noqa: BLE001
+        pass
+    phone = os.environ.get("DEFAULT_ADMIN_PHONE", phone).strip() or phone
+    return normalize_phone(phone) or DEFAULT_ADMIN_PHONE
+
+
+def _set_admin_phone_on_session(client) -> None:
+    """Attach phone (+ role) to the signed-in default admin user."""
+    phone = _admin_phone_value()
+    client.auth.update_user(
+        {
+            "data": {
+                "role": "admin",
+                "phone": phone,
+            }
+        }
+    )
+
+
+def _clear_admin_markers() -> None:
+    for path in (_admin_marker_path(), _admin_phone_marker_path()):
+        try:
+            if path.exists():
+                path.unlink()
+        except OSError:
+            pass
+
+
+def _write_admin_markers(email: str) -> None:
+    marker = _admin_marker_path()
+    phone_marker = _admin_phone_marker_path()
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text(email, encoding="utf-8")
+    phone_marker.write_text(_admin_phone_value(), encoding="utf-8")
+
+
+def _try_admin_sign_in(client, email: str, password: str) -> tuple[bool, str]:
+    """Return (ok, reason). ok means credentials work."""
+    try:
+        client.auth.sign_in_with_password({"email": email, "password": password})
+        try:
+            _set_admin_phone_on_session(client)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            client.auth.sign_out()
+        except Exception:  # noqa: BLE001
+            pass
+        return True, "ok"
+    except Exception as exc:  # noqa: BLE001
+        text = str(exc).lower()
+        if "rate limit" in text or "too many" in text:
+            return False, "rate_limited"
+        if "email not confirmed" in text:
+            return False, "unconfirmed"
+        if "invalid" in text or "credentials" in text:
+            return False, "invalid_credentials"
+        return False, "error"
+
+
+def _bootstrap_default_admin() -> str:
+    """Ensure the default admin can sign in; create it when missing.
+
+    The on-disk marker is only written after a successful credential check, so a
+    stale flag cannot block recreation forever.
+    """
     if not auth_configured():
         return "skipped"
 
-    marker = _admin_marker_path()
-    if marker.exists():
-        return "exists"
-
     email, password = default_admin_credentials()
+    marker = _admin_marker_path()
+
     try:
         client = _client()
-        # Prefer sign-in so we do not trigger another confirmation email.
-        try:
-            client.auth.sign_in_with_password({"email": email, "password": password})
-            try:
-                client.auth.sign_out()
-            except Exception:  # noqa: BLE001
-                pass
-            marker.parent.mkdir(parents=True, exist_ok=True)
-            marker.write_text(email, encoding="utf-8")
-            return "exists"
-        except Exception as sign_in_exc:  # noqa: BLE001
-            text = str(sign_in_exc).lower()
-            # Only sign up when the account is clearly missing.
-            if "invalid" not in text and "credentials" not in text:
-                if "rate limit" in text or "too many" in text:
-                    return "rate_limited"
-                return "error"
+    except Exception:  # noqa: BLE001
+        return "error"
 
+    # Fast path: marker present AND credentials still work.
+    if marker.exists():
+        ok, reason = _try_admin_sign_in(client, email, password)
+        if ok:
+            _write_admin_markers(email)
+            return "exists"
+        if reason == "rate_limited":
+            return "rate_limited"
+        if reason == "unconfirmed":
+            # Account exists; user must confirm email — do not recreate.
+            _write_admin_markers(email)
+            return "unconfirmed"
+        # Stale marker / wrong password / deleted user → recreate attempt.
+        _clear_admin_markers()
+
+    # Sign-in first (no confirmation email) before creating.
+    ok, reason = _try_admin_sign_in(client, email, password)
+    if ok:
+        _write_admin_markers(email)
+        return "exists"
+    if reason == "rate_limited":
+        return "rate_limited"
+    if reason == "unconfirmed":
+        _write_admin_markers(email)
+        return "unconfirmed"
+    if reason == "error":
+        return "error"
+
+    # Invalid credentials → account missing (or password mismatch). Try sign-up.
+    try:
         response = client.auth.sign_up(
             {
                 "email": email,
                 "password": password,
-                "options": {"data": {"role": "admin"}},
+                "options": {
+                    "data": {
+                        "role": "admin",
+                        "phone": _admin_phone_value(),
+                    }
+                },
             }
         )
     except Exception as exc:  # noqa: BLE001
         text = str(exc).lower()
         if "already" in text:
-            marker.parent.mkdir(parents=True, exist_ok=True)
-            marker.write_text(email, encoding="utf-8")
-            return "exists"
+            # Email taken but our password failed — cannot fix without service role.
+            return "exists_mismatch"
         if "rate limit" in text or "too many" in text:
             return "rate_limited"
         return "error"
 
     user = getattr(response, "user", None)
+    session = getattr(response, "session", None)
     identities = getattr(user, "identities", None) if user is not None else None
-    if user is None or identities == []:
-        marker.parent.mkdir(parents=True, exist_ok=True)
-        marker.write_text(email, encoding="utf-8")
-        return "exists"
 
-    marker.parent.mkdir(parents=True, exist_ok=True)
-    marker.write_text(email, encoding="utf-8")
+    # Fake "success" with empty identities usually means email already registered.
+    if user is None or identities == []:
+        ok, reason = _try_admin_sign_in(client, email, password)
+        if ok:
+            _write_admin_markers(email)
+            return "exists"
+        if reason == "unconfirmed":
+            _write_admin_markers(email)
+            return "unconfirmed"
+        return "exists_mismatch"
+
+    if session is None:
+        # Created but email confirmation required before sign-in works.
+        _write_admin_markers(email)
+        try:
+            client.auth.sign_out()
+        except Exception:  # noqa: BLE001
+            pass
+        return "created_unconfirmed"
+
+    try:
+        _set_admin_phone_on_session(client)
+    except Exception:  # noqa: BLE001
+        pass
     try:
         client.auth.sign_out()
     except Exception:  # noqa: BLE001
         pass
-    return "created"
+
+    # Verify credentials before declaring success.
+    ok, reason = _try_admin_sign_in(client, email, password)
+    if ok:
+        _write_admin_markers(email)
+        return "created"
+    if reason == "unconfirmed":
+        _write_admin_markers(email)
+        return "created_unconfirmed"
+    return "error"
+
+
+def default_admin_bootstrap_message(status: str | None = None) -> str | None:
+    """Human-readable bootstrap note for the auth screen (or None if quiet)."""
+    status = status or st.session_state.get("default_admin_status")
+    if not status or status in {"exists", "created", "skipped"}:
+        return None
+    if status == "created_unconfirmed" or status == "unconfirmed":
+        return (
+            "Default admin was created but must confirm email in Supabase "
+            "(or disable Confirm email) before signing in."
+        )
+    if status == "rate_limited":
+        return (
+            "Could not bootstrap the default admin — Supabase email rate limit. "
+            "Wait and retry, or create the admin manually in Supabase."
+        )
+    if status == "exists_mismatch":
+        return (
+            "Default admin email already exists in Supabase with a different password. "
+            "Reset it in Supabase Auth, or update default_admin_password in secrets."
+        )
+    if status == "error":
+        return "Could not create the default admin account. Check Supabase Auth settings."
+    return None
 
 
 def _clear_session() -> None:
@@ -233,15 +411,24 @@ def _friendly_error(exc: BaseException) -> str:
     return text
 
 
-def sign_up(email: str, password: str) -> AuthResult:
+def sign_up(email: str, password: str, phone: str | None = None) -> AuthResult:
     email = email.strip().lower()
+    phone_err = validate_phone(phone)
+    if phone_err:
+        return AuthResult(ok=False, message=phone_err)
+    phone_norm = normalize_phone(phone)
     try:
         client = _client()
         response = client.auth.sign_up(
             {
                 "email": email,
                 "password": password,
-                "options": {"data": {"role": "customer"}},
+                "options": {
+                    "data": {
+                        "role": "customer",
+                        "phone": phone_norm,
+                    }
+                },
             }
         )
     except Exception as exc:  # noqa: BLE001

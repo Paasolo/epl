@@ -29,6 +29,8 @@ Use the Project URL and the **anon public** key (Settings → API). Without thes
 
 If email confirmation is enabled in Supabase, new users must confirm their inbox before signing in; if it is disabled, sign-up signs them in immediately.
 
+**Create account** collects email, phone number, and password. The phone is stored in Supabase `user_metadata.phone` (also attached to Paystack checkout metadata when the customer pays).
+
 ### Paystack weekly unlock (Customers)
 
 **Customer** accounts must pay **GHS 50** per official matchweek (via [Paystack](https://paystack.com)) before ranked prediction results, cards, and downloads are shown. One payment unlocks that matchweek across **all leagues**. **Admin** accounts skip payment.
@@ -42,6 +44,21 @@ secret_key = "sk_test_..."
 ```
 
 Optional: set `APP_URL = "https://your-app.streamlit.app"` so Paystack can redirect back after checkout when the auto-detected URL is wrong.
+
+### Nalo SMS (payment confirmation)
+
+After a successful Paystack unlock, the app sends an SMS to the customer’s phone via [Nalo Solutions](https://www.nalosolutions.com/). Add a `[NaloSms]` block to `.streamlit/secrets.toml` (or Streamlit Cloud secrets):
+
+```toml
+[NaloSms]
+Enabled = true
+NaloApiUrl = "https://sms.nalosolutions.com/smsbackend/clientapi/Resl_Nalo/send-message/"
+NaloApiKey = "your_nalo_api_key"
+NaloSenderId = "SpareLink"
+RequestDeliveryReport = true
+```
+
+`NaloSenderId` must be an approved sender ID on your Nalo account (max 11 characters). Set `Enabled = false` to turn SMS off without removing keys. Payment unlock still works if SMS is disabled or misconfigured.
 
 ### Google AdSense (Customers · Predict tab)
 
